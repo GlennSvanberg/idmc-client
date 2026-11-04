@@ -199,7 +199,7 @@ impl Root {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let filter = self.session.chooser_filter.to_ascii_lowercase();
+        let filter = self.session.chooser_filter.text.to_ascii_lowercase();
         let fields = self
             .session
             .backend
@@ -270,13 +270,9 @@ impl Root {
             .child(div().text_size(px(11.)).text_color(rgb(theme.muted)).child("Fields"))
             .child(
                 div()
-                    .text_size(px(11.))
-                    .text_color(rgb(theme.subtle))
-                    .child(if filter.is_empty() {
-                        "Type to filter".to_string()
-                    } else {
-                        format!("Filter: {filter}")
-                    }),
+                    .text_size(px(12.))
+                    .text_color(rgb(theme.text))
+                    .child(crate::edit::render_edit_line(&self.session.chooser_filter, "Type to filter", theme)),
             )
             .child(list)
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
@@ -284,6 +280,9 @@ impl Root {
     }
 
     fn render_detail(&self, id: &str, entity: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(selected) = self.session.file.selections.get(id).cloned() {
+            self.session.backend.prepare(entity, &selected);
+        }
         let record = self.session.current_record(id);
         let definition = self.session.backend.model().entity(entity).cloned();
         let mut body = div()

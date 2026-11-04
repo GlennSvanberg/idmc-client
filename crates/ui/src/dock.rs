@@ -234,10 +234,14 @@ impl Root {
             .on_drop(cx.listener(move |this, drag: &DragView, _, cx| {
                 if let Some((target, zone)) = this.session.dock_hover.take() {
                     if target == drop_check && !(drag.id == target && zone == Zone::Center) {
-                        this.session.file.layout.move_view(&drag.id, &target, zone).ok();
-                        this.session.file.focus = Some(drag.id.clone());
-                        this.session.file.layout.activate(&drag.id);
-                        this.session.status = this.session.save().unwrap_or_else(|err| err);
+                        match this.session.file.layout.move_view(&drag.id, &target, zone) {
+                            Ok(()) => {
+                                this.session.file.focus = Some(drag.id.clone());
+                                this.session.file.layout.activate(&drag.id);
+                                this.session.status = this.session.save().unwrap_or_else(|err| err);
+                            }
+                            Err(err) => this.session.status = err,
+                        }
                     }
                 }
                 cx.notify();

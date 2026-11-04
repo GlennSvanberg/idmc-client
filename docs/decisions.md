@@ -27,7 +27,17 @@ A `BusinessEntityReferenceField` becomes a many-to-one relationship plus a deriv
 
 Reference 360 files in this package carry the code-list identity only. There are no value rows. `mock/reference-values.json` supplies a handful of sample codes (gender, country, address type, phone type, …) and is documented as a sample, not as Informatica data. Names that are not in the model are an error, so the Person overlay is not applied to the Item export unless you pass it explicitly.
 
-Child rows are not master records. They live nested on the person. `MockBackend::related` projects them with ids `{parentId}::{field}::{index}`.
+Child rows are not master records. They live nested on the person. `related` projects them with ids `{parentId}::{field}::{index}`.
+
+## Live reads
+
+`IDMC_BACKEND=live` (or `--backend live`) logs in and searches. The default stays mock so CI and a checkout without credentials still open the Person sample. Credentials live in `.env`, which is gitignored. `.env.example` lists the keys. The client never prints the password or `IDS-SESSION-ID`.
+
+Login is v3 `POST {login}/saas/public/core/v3/login` (`products[].baseApiUrl`, `userInfo.sessionId`, which may be a JWT). A 404, 405, or 501 falls back to v2 `POST {login}/ma/api/v2/user/login` (`serverUrl`, `icSessionId`). A 401 or 403 does not fall through, so a bad password is not tried twice. The header on later calls is `IDS-SESSION-ID` for both versions, plus `MODEL_VERSION` set once to the epoch in milliseconds. The MDM host drops `/saas` from `baseApiUrl` or `serverUrl` and adds `-mdm` to the first DNS label when it is not already there. An IP host is left alone so a local stub can serve both.
+
+Search is `POST {mdm}/search/public/api/v1/search` with `entityType`, `search: "*"`, `pageSize`, `recordOffset`, and `recordsToReturn`. `fields` is not sent in the same body. Record ids are `_meta.businessId`. Search field names are prefixed with the entity id with the dots removed (`c360person.firstName`). The read API, `GET {mdm}/business-entity/public/api/v1/entity/{businessEntity}/{businessId}`, uses unprefixed names. Lookup values are `{Code, Name}` and the name is shown even when `reference-values.json` does not list that code. `_meta.id` is not used as the record id. `_contentMeta` is not stored.
+
+The first search page of each master entity is loaded before the window opens. Further pages run on a background thread. A 401 logs in once and retries. A 429 honors `Retry-After` (capped at 30s) or waits with a short backoff. `--check-login` prints whether login and one search worked and does not open a window. `--debug-dump` writes responses with session ids and passwords replaced by `***`.
 
 ## Workspace file
 
@@ -35,8 +45,8 @@ Child rows are not master records. They live nested on the person. `MockBackend:
 
 ## Open questions
 
-* Where real code-list value rows come from. This export does not contain them. A Reference 360 API, or a fuller export, has to fill `reference-values.json` before the lookups are anything but samples.
-* IDMC authentication, org, and the runtime read API. There is no live backend yet. `Backend` is the seam.
+* Where a full code-list catalog comes from. The export still has no value rows. Live search and read responses carry `{Code, Name}` for the values on the records that were returned. Codes that never appear on a record stay blank unless `reference-values.json` lists them.
+* There is still no documented metadata API. The model is the export package. `GET /metadata/api/v2/objects/...` shows up only as a relationship helper and is not called.
 * This Person export has no hierarchy. The tree view works for models that declare one (the sample category tree). It is not invented for Person.
 * Promoting every `allowMany` group to a child entity is the linking model. A group that should stay an inline editor, rather than its own table, is not distinguished yet.
 * Inverse relationships are derived from reference fields. If the export later contains explicit relationships, those should win and the derived inverse should not be duplicated.

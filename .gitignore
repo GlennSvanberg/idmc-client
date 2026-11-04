@@ -1,4 +1,5 @@
 /target
 workspace.json
+.env
 **/*.rs.bk
 .DS_Store

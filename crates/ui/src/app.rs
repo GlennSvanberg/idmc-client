@@ -1,14 +1,17 @@
 //! GPUI shell: command palette, menus, theme, and the docking surface.
 
+use std::time::Duration;
+
 use gpui::{
     actions, div, px, prelude::*, rgb, size, AnyElement, App, Application, Bounds, ClickEvent,
     Context, FocusHandle, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, Render,
-    SharedString, Window, WindowBounds, WindowOptions,
+    SharedString, Timer, Window, WindowBounds, WindowOptions,
 };
 use idmc_backend::Backend;
 use idmc_layout::Dir;
 
-use crate::session::{launch_from_args, Effect, MenuCommand, PaletteMode, Session};
+use crate::edit::render_edit_line;
+use crate::session::{launch_from_args, Effect, Launch, MenuCommand, PaletteMode, Session};
 use crate::theme::{theme, Theme};
 
 actions!(
@@ -86,6 +89,23 @@ pub struct Root {
 
 impl Root {
     fn new(session: Session, cx: &mut Context<Self>) -> Self {
+        cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(400)).await;
+                if this
+                    .update(cx, |root, cx| {
+                        if root.session.backend.poll() {
+                            root.session.reconcile();
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
             session,
             focus: cx.focus_handle(),
@@ -129,6 +149,7 @@ impl Root {
             x: f32::from(pos.x),
             y: f32::from(pos.y),
             items: vec![
+                item("Open view", "", MenuCommand::Run("view.open")),
                 item("New table view", "", MenuCommand::Run("view.new_table")),
                 item("New detail view", "", MenuCommand::Run("view.new_detail")),
                 item("New tree view", "", MenuCommand::Run("view.new_tree")),
@@ -155,36 +176,60 @@ impl Root {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let key = event.keystroke.key.as_str();
+        let key = event.keystroke.key.to_ascii_lowercase();
         let mods = &event.keystroke.modifiers;
+        let editing = self.session.palette.open || self.session.chooser_for.is_some();
+        if !editing {
+            if key == "escape" {
+                self.session.escape();
+                cx.notify();
+            }
+            return;
+        }
+        let command = mods.control || mods.platform;
+        if command && !mods.alt && key == "a" {
+            self.session.select_all_text();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if mods.control || mods.alt || mods.platform {
             return;
         }
-        if self.session.palette.open || self.session.chooser_for.is_some() {
-            match key {
-                "escape" => self.session.escape(),
-                "enter" => {
-                    if self.session.palette.open {
-                        let effect = self.session.confirm_palette();
-                        if effect == Effect::Quit {
-                            cx.quit();
-                        }
+        let shift = mods.shift;
+        let mut handled = true;
+        match key.as_str() {
+            "escape" => self.session.escape(),
+            "enter" => {
+                if self.session.palette.open {
+                    let effect = self.session.confirm_palette();
+                    if effect == Effect::Quit {
+                        cx.quit();
                     }
                 }
-                "backspace" => self.session.backspace(),
-                _ => {
-                    if let Some(text) = &event.keystroke.key_char {
-                        if let Some(ch) = text.chars().next() {
-                            if text.chars().count() == 1 && !ch.is_control() {
-                                self.session.type_char(ch);
-                            }
+            }
+            "backspace" => self.session.backspace(),
+            "delete" | "forwarddelete" => self.session.delete_forward(),
+            "left" => self.session.move_left(shift),
+            "right" => self.session.move_right(shift),
+            "home" => self.session.move_home(shift),
+            "end" => self.session.move_end(shift),
+            "space" => self.session.type_char(' '),
+            "up" | "down" => handled = false,
+            _ => {
+                handled = false;
+                if let Some(text) = &event.keystroke.key_char {
+                    if let Some(ch) = text.chars().next() {
+                        if text.chars().count() == 1 && !ch.is_control() {
+                            self.session.type_char(ch);
+                            handled = true;
                         }
                     }
                 }
             }
-            cx.notify();
-        } else if key == "escape" {
-            self.session.escape();
+        }
+        if handled {
+            cx.stop_propagation();
             cx.notify();
         }
     }
@@ -199,6 +244,7 @@ impl Root {
                 idmc_model::ViewKind::Tree => "New tree",
             },
             PaletteMode::PickLink(_) => "Source link",
+            PaletteMode::OpenView => "Open view",
         };
         let mut list = div()
             .id("palette-list")
@@ -262,11 +308,12 @@ impl Root {
                             .flex_col()
                             .gap(px(2.))
                             .child(div().text_size(px(11.)).text_color(rgb(theme.subtle)).child(title))
-                            .child(div().text_size(px(14.)).child(if self.session.palette.query.is_empty() {
-                                "Type to filter".to_string()
-                            } else {
-                                self.session.palette.query.clone()
-                            })),
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .text_color(rgb(theme.text))
+                                    .child(render_edit_line(&self.session.palette.edit, "Type to filter", theme)),
+                            ),
                     )
                     .child(list),
             )
@@ -420,6 +467,16 @@ impl Root {
             .border_b_1()
             .border_color(rgb(theme.border))
             .child(div().text_size(px(13.)).child("IDMC Client"))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(if self.session.backend.connection().starts_with("Live") {
+                        theme.ok
+                    } else {
+                        theme.muted
+                    }))
+                    .child(self.session.backend.connection()),
+            )
             .child(div().text_size(px(11.)).text_color(rgb(theme.muted)).child(summary.to_string()))
             .child(div().flex_1())
             .child(
@@ -507,7 +564,15 @@ fn bind_keys(cx: &mut App) {
 
 pub fn main() {
     match launch_from_args(&std::env::args().skip(1).collect::<Vec<_>>()) {
-        Ok(session) => run(session),
+        Ok(Launch::Run(session)) => run(session),
+        Ok(Launch::Done { code, message }) => {
+            if code == 0 {
+                println!("{message}");
+            } else {
+                eprintln!("{message}");
+            }
+            std::process::exit(code);
+        }
         Err(err) => {
             eprintln!("{err}");
             std::process::exit(if err.starts_with("idmc-client") { 0 } else { 1 });

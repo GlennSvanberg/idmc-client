@@ -28,7 +28,21 @@ pub trait Backend {
     fn related(&self, relationship: &str, source_id: &str) -> Result<Vec<Record>, BackendError>;
     fn hierarchy_roots(&self, entity: &str) -> Vec<Record>;
     fn hierarchy_children(&self, entity: &str, id: &str) -> Vec<Record>;
+    /// Fetch a fuller master record when a search hit is missing nested groups.
+    fn prepare(&self, _entity: &str, _id: &str) {}
+    /// True when background loading has appended records since the last call.
+    fn poll(&self) -> bool { false }
+    /// Short connection line for the window chrome. No secrets.
+    fn connection(&self) -> String { "Mock".into() }
+    /// Display name captured from a live lookup `{Code, Name}` object.
+    fn lookup_name(&self, _lookup: Option<&str>, _code: &str) -> Option<String> { None }
 }
+
+mod config;
+mod live;
+
+pub use config::{load_dotenv, read_env, BackendMode, EnvConfig};
+pub use live::{check_login, mdm_base_from_api_url, LiveBackend, LiveConfig};
 
 #[derive(Clone, Debug)]
 pub struct MockBackend {
@@ -116,185 +130,182 @@ impl MockBackend {
         Ok(())
     }
 
-    fn sort_by_label(&self, mut rows: Vec<Record>) -> Vec<Record> {
-        rows.sort_by(|a, b| {
-            self.label_of(a)
-                .cmp(&self.label_of(b))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        rows
-    }
-
-    fn label_of(&self, record: &Record) -> String {
-        let Some(entity) = self.model.entity(&record.entity) else {
-            return record.id.clone();
-        };
-        compose_label(entity, &record.values, &self.model).unwrap_or_else(|| record.id.clone())
-    }
-
-    fn project_children(&self, parent: &Record, child_id: &str) -> Vec<Record> {
-        let Some(child) = self.model.entity(child_id) else { return Vec::new() };
-        let Some(embedded) = &child.embedded_in else { return Vec::new() };
-        let Some(value) = parent.values.get(&embedded.field) else { return Vec::new() };
-        let groups: Vec<&BTreeMap<String, FieldValue>> = match value {
-            FieldValue::List(items) => items
-                .iter()
-                .filter_map(|item| match item {
-                    FieldValue::Group(map) => Some(map),
-                    _ => None,
-                })
-                .collect(),
-            FieldValue::Group(map) => vec![map],
-            _ => Vec::new(),
-        };
-        groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, values)| Record {
-                entity: child.id.clone(),
-                id: format!("{}::{}::{index}", parent.id, embedded.field),
-                values: values.clone(),
-            })
-            .collect()
-    }
 }
 
 impl Backend for MockBackend {
-    fn model(&self) -> &ModelDefinition {
-        &self.model
-    }
-
-    fn records(&self, entity: &str) -> Vec<Record> {
-        if self
-            .model
-            .entity(entity)
-            .and_then(|e| e.embedded_in.as_ref())
-            .is_some()
-        {
-            let Some(child) = self.model.entity(entity) else { return Vec::new() };
-            let parent_id = child.embedded_in.as_ref().map(|e| e.parent.as_str()).unwrap_or("");
-            let mut rows = Vec::new();
-            for parent in self.records.iter().filter(|r| r.entity == parent_id) {
-                rows.extend(self.project_children(parent, entity));
-            }
-            return self.sort_by_label(rows);
-        }
-        let rows = self
-            .records
-            .iter()
-            .filter(|r| r.entity == entity)
-            .cloned()
-            .collect();
-        self.sort_by_label(rows)
-    }
-
-    fn record(&self, entity: &str, id: &str) -> Option<Record> {
-        if self
-            .model
-            .entity(entity)
-            .and_then(|e| e.embedded_in.as_ref())
-            .is_some()
-        {
-            return self.records(entity).into_iter().find(|r| r.id == id);
-        }
-        self.records
-            .iter()
-            .find(|r| r.entity == entity && r.id == id)
-            .cloned()
-    }
-
-    fn label(&self, entity: &str, id: &str) -> String {
-        self.record(entity, id)
-            .map(|r| self.label_of(&r))
-            .unwrap_or_else(|| id.to_string())
-    }
-
+    fn model(&self) -> &ModelDefinition { &self.model }
+    fn records(&self, entity: &str) -> Vec<Record> { records_of(&self.model, &self.records, entity) }
+    fn record(&self, entity: &str, id: &str) -> Option<Record> { record_of(&self.model, &self.records, entity, id) }
+    fn label(&self, entity: &str, id: &str) -> String { label_of(&self.model, &self.records, entity, id) }
     fn related(&self, relationship: &str, source_id: &str) -> Result<Vec<Record>, BackendError> {
-        if relationship == "identity" {
-            return Err(BackendError::Message(
-                "identity is resolved by the view, not the backend".into(),
-            ));
+        related_of(&self.model, &self.records, relationship, source_id)
+    }
+    fn hierarchy_roots(&self, entity: &str) -> Vec<Record> { hierarchy_roots_of(&self.model, &self.records, entity) }
+    fn hierarchy_children(&self, entity: &str, id: &str) -> Vec<Record> {
+        hierarchy_children_of(&self.model, &self.records, entity, id)
+    }
+}
+
+pub(crate) fn records_of(model: &ModelDefinition, records: &[Record], entity: &str) -> Vec<Record> {
+    if model.entity(entity).and_then(|e| e.embedded_in.as_ref()).is_some() {
+        let Some(child) = model.entity(entity) else { return Vec::new() };
+        let parent_id = child.embedded_in.as_ref().map(|e| e.parent.as_str()).unwrap_or("");
+        let mut rows = Vec::new();
+        for parent in records.iter().filter(|r| r.entity == parent_id) {
+            rows.extend(project_children(model, parent, entity));
         }
-        let rel = self.model.relationship(relationship).ok_or_else(|| {
-            BackendError::Message(format!("unknown relationship {relationship}"))
+        return sort_by_label(model, rows);
+    }
+    let rows = records.iter().filter(|r| r.entity == entity).cloned().collect();
+    sort_by_label(model, rows)
+}
+
+pub(crate) fn record_of(model: &ModelDefinition, records: &[Record], entity: &str, id: &str) -> Option<Record> {
+    if model.entity(entity).and_then(|e| e.embedded_in.as_ref()).is_some() {
+        return records_of(model, records, entity).into_iter().find(|r| r.id == id);
+    }
+    records.iter().find(|r| r.entity == entity && r.id == id).cloned()
+}
+
+pub(crate) fn label_of(model: &ModelDefinition, records: &[Record], entity: &str, id: &str) -> String {
+    record_of(model, records, entity, id)
+        .map(|record| label_text(model, &record))
+        .unwrap_or_else(|| id.to_string())
+}
+
+pub(crate) fn related_of(
+    model: &ModelDefinition,
+    records: &[Record],
+    relationship: &str,
+    source_id: &str,
+) -> Result<Vec<Record>, BackendError> {
+    if relationship == "identity" {
+        return Err(BackendError::Message(
+            "identity is resolved by the view, not the backend".into(),
+        ));
+    }
+    let rel = model.relationship(relationship).ok_or_else(|| {
+        BackendError::Message(format!("unknown relationship {relationship}"))
+    })?;
+    if rel.embedded {
+        let parent = record_of(model, records, &rel.from, source_id).ok_or_else(|| {
+            BackendError::Message(format!("no {} record {source_id}", rel.from))
         })?;
-        if rel.embedded {
-            let parent = self.record(&rel.from, source_id).ok_or_else(|| {
+        return Ok(sort_by_label(model, project_children(model, &parent, &rel.to)));
+    }
+    match rel.field_on {
+        FieldSide::To => {
+            let rows = records_of(model, records, &rel.to)
+                .into_iter()
+                .filter(|row| {
+                    value_at(&row.values, &rel.field)
+                        .and_then(|v| v.as_id())
+                        .is_some_and(|id| id == source_id)
+                })
+                .collect();
+            Ok(sort_by_label(model, rows))
+        }
+        FieldSide::From => {
+            let source = record_of(model, records, &rel.from, source_id).ok_or_else(|| {
                 BackendError::Message(format!("no {} record {source_id}", rel.from))
             })?;
-            return Ok(self.sort_by_label(self.project_children(&parent, &rel.to)));
-        }
-        match rel.field_on {
-            FieldSide::To => {
-                let rows = self.records(&rel.to)
+            let Some(id) = value_at(&source.values, &rel.field).and_then(|v| v.as_id()) else {
+                return Ok(Vec::new());
+            };
+            match rel.cardinality {
+                Cardinality::OneToMany => Ok(records_of(model, records, &rel.to)
                     .into_iter()
-                    .filter(|row| {
-                        value_at(&row.values, &rel.field)
-                            .and_then(|v| v.as_id())
-                            .is_some_and(|id| id == source_id)
-                    })
-                    .collect();
-                Ok(self.sort_by_label(rows))
-            }
-            FieldSide::From => {
-                let source = self.record(&rel.from, source_id).ok_or_else(|| {
-                    BackendError::Message(format!("no {} record {source_id}", rel.from))
-                })?;
-                let Some(id) = value_at(&source.values, &rel.field).and_then(|v| v.as_id()) else {
-                    return Ok(Vec::new());
-                };
-                match rel.cardinality {
-                    Cardinality::OneToMany => Ok(self.records(&rel.to)
-                        .into_iter()
-                        .filter(|row| row.id == id)
-                        .collect()),
-                    _ => Ok(self.record(&rel.to, &id).into_iter().collect()),
-                }
+                    .filter(|row| row.id == id)
+                    .collect()),
+                _ => Ok(record_of(model, records, &rel.to, &id).into_iter().collect()),
             }
         }
     }
+}
 
-    fn hierarchy_roots(&self, entity: &str) -> Vec<Record> {
-        let Some(parent_field) = self
-            .model
-            .entity(entity)
-            .and_then(|e| e.hierarchy.as_ref())
-            .map(|h| h.parent_field.clone())
-        else {
-            return self.records(entity);
-        };
-        let rows = self
-            .records(entity)
-            .into_iter()
-            .filter(|row| match value_at(&row.values, &parent_field) {
-                None | Some(FieldValue::Null) => true,
-                Some(FieldValue::String(text)) => text.is_empty(),
-                _ => false,
-            })
-            .collect();
-        self.sort_by_label(rows)
-    }
+pub(crate) fn hierarchy_roots_of(model: &ModelDefinition, records: &[Record], entity: &str) -> Vec<Record> {
+    let Some(parent_field) = model
+        .entity(entity)
+        .and_then(|e| e.hierarchy.as_ref())
+        .map(|h| h.parent_field.clone())
+    else {
+        return records_of(model, records, entity);
+    };
+    let rows = records_of(model, records, entity)
+        .into_iter()
+        .filter(|row| match value_at(&row.values, &parent_field) {
+            None | Some(FieldValue::Null) => true,
+            Some(FieldValue::String(text)) => text.is_empty(),
+            _ => false,
+        })
+        .collect();
+    sort_by_label(model, rows)
+}
 
-    fn hierarchy_children(&self, entity: &str, id: &str) -> Vec<Record> {
-        let Some(parent_field) = self
-            .model
-            .entity(entity)
-            .and_then(|e| e.hierarchy.as_ref())
-            .map(|h| h.parent_field.clone())
-        else {
-            return Vec::new();
-        };
-        let rows = self
-            .records(entity)
-            .into_iter()
-            .filter(|row| {
-                value_at(&row.values, &parent_field)
-                    .and_then(|v| v.as_id())
-                    .is_some_and(|parent| parent == id)
+pub(crate) fn hierarchy_children_of(
+    model: &ModelDefinition,
+    records: &[Record],
+    entity: &str,
+    id: &str,
+) -> Vec<Record> {
+    let Some(parent_field) = model
+        .entity(entity)
+        .and_then(|e| e.hierarchy.as_ref())
+        .map(|h| h.parent_field.clone())
+    else {
+        return Vec::new();
+    };
+    let rows = records_of(model, records, entity)
+        .into_iter()
+        .filter(|row| {
+            value_at(&row.values, &parent_field)
+                .and_then(|v| v.as_id())
+                .is_some_and(|parent| parent == id)
+        })
+        .collect();
+    sort_by_label(model, rows)
+}
+
+fn sort_by_label(model: &ModelDefinition, mut rows: Vec<Record>) -> Vec<Record> {
+    rows.sort_by(|a, b| {
+        label_text(model, a)
+            .cmp(&label_text(model, b))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    rows
+}
+
+fn label_text(model: &ModelDefinition, record: &Record) -> String {
+    let Some(entity) = model.entity(&record.entity) else {
+        return record.id.clone();
+    };
+    compose_label(entity, &record.values, model).unwrap_or_else(|| record.id.clone())
+}
+
+pub(crate) fn project_children(model: &ModelDefinition, parent: &Record, child_id: &str) -> Vec<Record> {
+    let Some(child) = model.entity(child_id) else { return Vec::new() };
+    let Some(embedded) = &child.embedded_in else { return Vec::new() };
+    let Some(value) = parent.values.get(&embedded.field) else { return Vec::new() };
+    let groups: Vec<&BTreeMap<String, FieldValue>> = match value {
+        FieldValue::List(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                FieldValue::Group(map) => Some(map),
+                _ => None,
             })
-            .collect();
-        self.sort_by_label(rows)
-    }
+            .collect(),
+        FieldValue::Group(map) => vec![map],
+        _ => Vec::new(),
+    };
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, values)| Record {
+            entity: child.id.clone(),
+            id: format!("{}::{}::{index}", parent.id, embedded.field),
+            values: values.clone(),
+        })
+        .collect()
 }
 
 fn check_refs(
@@ -377,6 +388,102 @@ pub fn find_mock_dir() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Mock file data or a live Business 360 session. The UI holds one of these.
+pub enum AppBackend {
+    Mock(MockBackend),
+    Live(live::LiveBackend),
+}
+
+impl AppBackend {
+    pub fn is_live(&self) -> bool {
+        matches!(self, AppBackend::Live(_))
+    }
+
+    pub fn reload_file(&mut self, json: &str) -> Result<(), BackendError> {
+        match self {
+            AppBackend::Mock(backend) => backend.reload_data(json),
+            AppBackend::Live(_) => Err(BackendError::Message(
+                "live records reload from IDMC, not a file".into(),
+            )),
+        }
+    }
+
+    pub fn restart(&mut self) -> Result<(), BackendError> {
+        match self {
+            AppBackend::Mock(_) => Ok(()),
+            AppBackend::Live(backend) => backend.restart(),
+        }
+    }
+}
+
+impl Backend for AppBackend {
+    fn model(&self) -> &ModelDefinition {
+        match self {
+            AppBackend::Mock(backend) => backend.model(),
+            AppBackend::Live(backend) => backend.model(),
+        }
+    }
+    fn records(&self, entity: &str) -> Vec<Record> {
+        match self {
+            AppBackend::Mock(backend) => backend.records(entity),
+            AppBackend::Live(backend) => backend.records(entity),
+        }
+    }
+    fn record(&self, entity: &str, id: &str) -> Option<Record> {
+        match self {
+            AppBackend::Mock(backend) => backend.record(entity, id),
+            AppBackend::Live(backend) => backend.record(entity, id),
+        }
+    }
+    fn label(&self, entity: &str, id: &str) -> String {
+        match self {
+            AppBackend::Mock(backend) => backend.label(entity, id),
+            AppBackend::Live(backend) => backend.label(entity, id),
+        }
+    }
+    fn related(&self, relationship: &str, source_id: &str) -> Result<Vec<Record>, BackendError> {
+        match self {
+            AppBackend::Mock(backend) => backend.related(relationship, source_id),
+            AppBackend::Live(backend) => backend.related(relationship, source_id),
+        }
+    }
+    fn hierarchy_roots(&self, entity: &str) -> Vec<Record> {
+        match self {
+            AppBackend::Mock(backend) => backend.hierarchy_roots(entity),
+            AppBackend::Live(backend) => backend.hierarchy_roots(entity),
+        }
+    }
+    fn hierarchy_children(&self, entity: &str, id: &str) -> Vec<Record> {
+        match self {
+            AppBackend::Mock(backend) => backend.hierarchy_children(entity, id),
+            AppBackend::Live(backend) => backend.hierarchy_children(entity, id),
+        }
+    }
+    fn prepare(&self, entity: &str, id: &str) {
+        if let AppBackend::Live(backend) = self {
+            backend.prepare(entity, id);
+        }
+    }
+    fn poll(&self) -> bool {
+        match self {
+            AppBackend::Mock(_) => false,
+            AppBackend::Live(backend) => backend.poll(),
+        }
+    }
+    fn connection(&self) -> String {
+        match self {
+            AppBackend::Mock(_) => "Mock".into(),
+            AppBackend::Live(backend) => backend.connection(),
+        }
+    }
+    fn lookup_name(&self, lookup: Option<&str>, code: &str) -> Option<String> {
+        match self {
+            AppBackend::Mock(_) => None,
+            AppBackend::Live(backend) => backend.lookup_name(lookup, code),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -3,11 +3,14 @@
 
 use std::path::{Path, PathBuf};
 
-use idmc_backend::{Backend, MockBackend};
+use idmc_backend::{
+    check_login, load_dotenv, read_env, AppBackend, Backend, BackendMode, LiveConfig, MockBackend,
+};
 use idmc_layout::{Node, Zone};
 use idmc_model::{value_at, FieldDef, FieldType, FieldValue, Record, ViewKind};
 
 use crate::actions::{palette_actions, Action};
+use crate::edit::TextEdit;
 use crate::workspace::{default_workspace, sanitize, ViewLink, ViewSpec, WorkspaceFile};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,7 +22,7 @@ pub enum Effect {
 #[derive(Clone, Debug)]
 pub struct PaletteState {
     pub open: bool,
-    pub query: String,
+    pub edit: TextEdit,
     pub cursor: usize,
     pub mode: PaletteMode,
 }
@@ -29,13 +32,14 @@ pub enum PaletteMode {
     Commands,
     PickEntity(ViewKind),
     PickLink(String),
+    OpenView,
 }
 
 impl PaletteState {
     fn closed() -> Self {
         Self {
             open: false,
-            query: String::new(),
+            edit: TextEdit::new(),
             cursor: 0,
             mode: PaletteMode::Commands,
         }
@@ -44,10 +48,14 @@ impl PaletteState {
     pub fn open_commands(&mut self) {
         *self = Self {
             open: true,
-            query: String::new(),
+            edit: TextEdit::new(),
             cursor: 0,
             mode: PaletteMode::Commands,
         };
+    }
+
+    pub fn query(&self) -> &str {
+        self.edit.text.as_str()
     }
 }
 
@@ -74,7 +82,7 @@ pub enum MenuCommand {
 }
 
 pub struct Session {
-    pub backend: MockBackend,
+    pub backend: AppBackend,
     pub file: WorkspaceFile,
     pub workspace_path: PathBuf,
     pub data_path: Option<PathBuf>,
@@ -82,9 +90,14 @@ pub struct Session {
     pub palette: PaletteState,
     pub menu: Option<MenuState>,
     pub chooser_for: Option<String>,
-    pub chooser_filter: String,
+    pub chooser_filter: TextEdit,
     pub dock_hover: Option<(String, Zone)>,
     pub pending_dock: Option<String>,
+}
+
+pub enum Launch {
+    Run(Session),
+    Done { code: i32, message: String },
 }
 
 impl Session {
@@ -208,6 +221,13 @@ impl Session {
                 _ => String::new(),
             };
         }
+        if field.ty == FieldType::Lookup {
+            if let FieldValue::String(code) = value {
+                if let Some(name) = self.backend.lookup_name(field.lookup.as_deref(), code) {
+                    return name;
+                }
+            }
+        }
         self.backend
             .model()
             .format_field(field, value, &|_, id| id.to_string())
@@ -269,6 +289,7 @@ impl Session {
             "view.new_table" => self.begin_new(ViewKind::Table),
             "view.new_detail" => self.begin_new(ViewKind::Detail),
             "view.new_tree" => self.begin_new(ViewKind::Tree),
+            "view.open" => self.begin_open(),
             "view.fields" => self.toggle_chooser(self.file.focus.clone()),
             "view.link" => self.begin_link(self.file.focus.clone()),
             "view.unlink" => {
@@ -310,10 +331,42 @@ impl Session {
 
     pub fn palette_len(&self) -> usize {
         match &self.palette.mode {
-            PaletteMode::Commands => palette_actions(&self.palette.query).len(),
-            PaletteMode::PickEntity(kind) => self.entity_choices(*kind, &self.palette.query).len(),
-            PaletteMode::PickLink(view) => self.link_choices(view, &self.palette.query).len(),
+            PaletteMode::Commands => palette_actions(self.palette.query()).len(),
+            PaletteMode::PickEntity(kind) => self.entity_choices(*kind, self.palette.query()).len(),
+            PaletteMode::PickLink(view) => self.link_choices(view, self.palette.query()).len(),
+            PaletteMode::OpenView => self.open_view_choices(self.palette.query()).len(),
         }
+    }
+
+    pub fn open_view_choices(&self, query: &str) -> Vec<(ViewKind, String, String)> {
+        let q = query.trim().to_ascii_lowercase();
+        let mut out = Vec::new();
+        for entity in &self.backend.model().entities {
+            for kind in [ViewKind::Table, ViewKind::Detail, ViewKind::Tree] {
+                if kind == ViewKind::Tree && entity.hierarchy.is_none() {
+                    continue;
+                }
+                let kind_label = match kind {
+                    ViewKind::Table => "Table",
+                    ViewKind::Detail => "Detail",
+                    ViewKind::Tree => "Tree",
+                };
+                let name = if kind == ViewKind::Table {
+                    entity.label_plural.as_str()
+                } else {
+                    entity.label.as_str()
+                };
+                let title = format!("{kind_label} · {name}");
+                if q.is_empty()
+                    || title.to_ascii_lowercase().contains(&q)
+                    || entity.id.to_ascii_lowercase().contains(&q)
+                    || entity.label.to_ascii_lowercase().contains(&q)
+                {
+                    out.push((kind, entity.id.clone(), title));
+                }
+            }
+        }
+        out
     }
 
     pub fn entity_choices(&self, kind: ViewKind, query: &str) -> Vec<(String, String)> {
@@ -372,16 +425,16 @@ impl Session {
         }
         match self.palette.mode.clone() {
             PaletteMode::Commands => {
-                let items = palette_actions(&self.palette.query);
+                let items = palette_actions(self.palette.query());
                 let Some(action) = items.get(self.palette.cursor).copied() else {
                     return Effect::None;
                 };
                 self.palette.open = false;
-                self.palette.query.clear();
+                self.palette.edit.clear();
                 self.perform(action.id)
             }
             PaletteMode::PickEntity(kind) => {
-                let choices = self.entity_choices(kind, &self.palette.query);
+                let choices = self.entity_choices(kind, self.palette.query());
                 let Some((entity, _)) = choices.get(self.palette.cursor) else {
                     self.status = if kind == ViewKind::Tree {
                         "This model has no hierarchical entities".into()
@@ -396,8 +449,21 @@ impl Session {
                 self.open_view(kind, &entity, dock);
                 Effect::None
             }
+            PaletteMode::OpenView => {
+                let choices = self.open_view_choices(self.palette.query());
+                let Some((kind, entity, _)) = choices.get(self.palette.cursor) else {
+                    self.status = "No matching view".into();
+                    return Effect::None;
+                };
+                let kind = *kind;
+                let entity = entity.clone();
+                let dock = self.pending_dock.clone();
+                self.palette.open = false;
+                self.open_view(kind, &entity, dock);
+                Effect::None
+            }
             PaletteMode::PickLink(view) => {
-                let choices = self.link_choices(&view, &self.palette.query);
+                let choices = self.link_choices(&view, self.palette.query());
                 let Some((source, relationship, _)) = choices.get(self.palette.cursor) else {
                     self.status = "No compatible source view".into();
                     return Effect::None;
@@ -413,19 +479,24 @@ impl Session {
 
     pub fn palette_rows(&self) -> Vec<PaletteRow> {
         match &self.palette.mode {
-            PaletteMode::Commands => palette_actions(&self.palette.query)
+            PaletteMode::Commands => palette_actions(self.palette.query())
                 .into_iter()
                 .map(PaletteRow::from_action)
                 .collect(),
             PaletteMode::PickEntity(kind) => self
-                .entity_choices(*kind, &self.palette.query)
+                .entity_choices(*kind, self.palette.query())
                 .into_iter()
                 .map(|(_, label)| PaletteRow { title: label, shortcut: String::new(), detail: String::new() })
                 .collect(),
             PaletteMode::PickLink(view) => self
-                .link_choices(view, &self.palette.query)
+                .link_choices(view, self.palette.query())
                 .into_iter()
                 .map(|(_, _, label)| PaletteRow { title: label, shortcut: String::new(), detail: String::new() })
+                .collect(),
+            PaletteMode::OpenView => self
+                .open_view_choices(self.palette.query())
+                .into_iter()
+                .map(|(_, _, title)| PaletteRow { title, shortcut: String::new(), detail: String::new() })
                 .collect(),
         }
     }
@@ -438,9 +509,24 @@ impl Session {
         self.pending_dock = self.file.focus.clone();
         self.palette = PaletteState {
             open: true,
-            query: String::new(),
+            edit: TextEdit::new(),
             cursor: 0,
             mode: PaletteMode::PickEntity(kind),
+        };
+        self.menu = None;
+    }
+
+    fn begin_open(&mut self) {
+        if self.open_view_choices("").is_empty() {
+            self.status = "This model has no entities".into();
+            return;
+        }
+        self.pending_dock = self.file.focus.clone();
+        self.palette = PaletteState {
+            open: true,
+            edit: TextEdit::new(),
+            cursor: 0,
+            mode: PaletteMode::OpenView,
         };
         self.menu = None;
     }
@@ -456,7 +542,7 @@ impl Session {
         }
         self.palette = PaletteState {
             open: true,
-            query: String::new(),
+            edit: TextEdit::new(),
             cursor: 0,
             mode: PaletteMode::PickLink(view),
         };
@@ -696,12 +782,22 @@ impl Session {
     }
 
     fn reload_data(&mut self) {
+        if self.backend.is_live() {
+            match self.backend.restart() {
+                Ok(()) => {
+                    self.reconcile();
+                    self.status = self.backend.connection();
+                }
+                Err(err) => self.status = format!("Reload failed: {err}"),
+            }
+            return;
+        }
         let Some(path) = self.data_path.clone() else {
             self.status = "No record file to reload".into();
             return;
         };
         match std::fs::read_to_string(&path) {
-            Ok(text) => match self.backend.reload_data(&text) {
+            Ok(text) => match self.backend.reload_file(&text) {
                 Ok(()) => {
                     self.reconcile();
                     self.status = format!("Reloaded {}", path.display());
@@ -712,22 +808,45 @@ impl Session {
         }
     }
 
-    pub fn type_char(&mut self, ch: char) {
+    fn edit_text(&mut self, edit: impl FnOnce(&mut TextEdit)) {
         if self.palette.open {
-            self.palette.query.push(ch);
+            edit(&mut self.palette.edit);
             self.palette.cursor = 0;
         } else if self.chooser_for.is_some() {
-            self.chooser_filter.push(ch);
+            edit(&mut self.chooser_filter);
         }
     }
 
+    pub fn type_char(&mut self, ch: char) {
+        self.edit_text(|text| text.insert(ch));
+    }
+
     pub fn backspace(&mut self) {
-        if self.palette.open {
-            self.palette.query.pop();
-            self.palette.cursor = 0;
-        } else if self.chooser_for.is_some() {
-            self.chooser_filter.pop();
-        }
+        self.edit_text(|text| text.backspace());
+    }
+
+    pub fn delete_forward(&mut self) {
+        self.edit_text(|text| text.delete_forward());
+    }
+
+    pub fn move_left(&mut self, shift: bool) {
+        self.edit_text(|text| text.move_left(shift));
+    }
+
+    pub fn move_right(&mut self, shift: bool) {
+        self.edit_text(|text| text.move_right(shift));
+    }
+
+    pub fn move_home(&mut self, shift: bool) {
+        self.edit_text(|text| text.home(shift));
+    }
+
+    pub fn move_end(&mut self, shift: bool) {
+        self.edit_text(|text| text.end(shift));
+    }
+
+    pub fn select_all_text(&mut self) {
+        self.edit_text(|text| text.select_all());
     }
 
     pub fn escape(&mut self) {
@@ -760,12 +879,16 @@ impl PaletteRow {
     }
 }
 
-pub fn launch_from_args(args: &[String]) -> Result<Session, String> {
+pub fn launch_from_args(args: &[String]) -> Result<Launch, String> {
+    load_dotenv();
     let mut export: Option<PathBuf> = None;
     let mut model: Option<PathBuf> = None;
     let mut data: Option<PathBuf> = None;
     let mut values: Option<PathBuf> = None;
     let mut workspace: Option<PathBuf> = None;
+    let mut backend_flag: Option<BackendMode> = None;
+    let mut debug_dump: Option<PathBuf> = None;
+    let mut check = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -782,27 +905,85 @@ pub fn launch_from_args(args: &[String]) -> Result<Session, String> {
             "--data" => data = Some(take(&mut index)?),
             "--values" => values = Some(take(&mut index)?),
             "--workspace" => workspace = Some(take(&mut index)?),
+            "--backend" => {
+                index += 1;
+                let value = args.get(index).ok_or_else(|| "--backend needs mock or live".to_string())?;
+                backend_flag = Some(BackendMode::parse(value)?);
+            }
+            "--debug-dump" => debug_dump = Some(take(&mut index)?),
+            "--check-login" => check = true,
             "--help" | "-h" => return Err(help_text()),
             other if other.starts_with('-') => return Err(format!("unknown argument {other}\n{}", help_text())),
             other => return Err(format!("unexpected argument {other}")),
         }
         index += 1;
     }
+    let env = read_env().map_err(|err| err)?;
+    let mode = backend_flag.unwrap_or(env.mode);
+    let export = export.or_else(|| env.model_export.clone());
+    let debug_dump = debug_dump.or_else(|| env.debug_dump.clone());
+    if check || mode == BackendMode::Live {
+        let config = live_config(&env, export.clone(), model.clone(), values.clone(), debug_dump.clone())?;
+        if check {
+            return match check_login(&config) {
+                Ok(message) => Ok(Launch::Done { code: 0, message }),
+                Err(err) => Ok(Launch::Done { code: 1, message: err.to_string() }),
+            };
+        }
+        let backend = AppBackend::Live(idmc_backend::LiveBackend::open(config).map_err(|err| err.to_string())?);
+        return Ok(Launch::Run(finish_session(backend, None, workspace)?));
+    }
     let (backend, data_path) = if let Some(model_path) = model {
         let data_path = data.unwrap_or_else(|| sibling(&model_path, "data.json"));
         let backend = MockBackend::open_json(&model_path, &data_path).map_err(|err| err.to_string())?;
-        (backend, Some(data_path))
+        (AppBackend::Mock(backend), Some(data_path))
     } else if let Some(export_path) = export {
         let backend = MockBackend::open_export(&export_path, values.as_deref(), data.as_deref())
             .map_err(|err| err.to_string())?;
-        (backend, data)
+        (AppBackend::Mock(backend), data)
     } else {
         let mock = idmc_backend::find_mock_dir().ok_or_else(|| {
             "could not find mock/. Run from the repository, or pass --export / --model.".to_string()
         })?;
         let backend = MockBackend::open_default().map_err(|err| err.to_string())?;
-        (backend, Some(mock.join("data.json")))
+        (AppBackend::Mock(backend), Some(mock.join("data.json")))
     };
+    Ok(Launch::Run(finish_session(backend, data_path, workspace)?))
+}
+
+fn live_config(
+    env: &idmc_backend::EnvConfig,
+    export: Option<PathBuf>,
+    model: Option<PathBuf>,
+    values: Option<PathBuf>,
+    debug_dump: Option<PathBuf>,
+) -> Result<LiveConfig, String> {
+    let login_url = env.login_url.clone().ok_or("Set IDMC_LOGIN_URL in .env")?;
+    let username = env.username.clone().ok_or("Set IDMC_USERNAME in .env")?;
+    let password = env.password.clone().ok_or("Set IDMC_PASSWORD in .env")?;
+    let values = values.or_else(|| {
+        if export.is_some() || model.is_some() {
+            None
+        } else {
+            idmc_backend::find_mock_dir().map(|dir| dir.join("reference-values.json"))
+        }
+    });
+    Ok(LiveConfig {
+        login_url,
+        username,
+        password,
+        export: if model.is_some() { None } else { export },
+        model_json: model,
+        values,
+        debug_dump,
+    })
+}
+
+fn finish_session(
+    backend: AppBackend,
+    data_path: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+) -> Result<Session, String> {
     let workspace_path = workspace.unwrap_or_else(|| {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -831,12 +1012,16 @@ pub fn launch_from_args(args: &[String]) -> Result<Session, String> {
         palette: PaletteState::closed(),
         menu: None,
         chooser_for: None,
-        chooser_filter: String::new(),
+        chooser_filter: TextEdit::new(),
         dock_hover: None,
         pending_dock: None,
     };
     session.reconcile();
-    session.status = session.backend.model().summary();
+    session.status = if session.backend.is_live() {
+        session.backend.connection()
+    } else {
+        session.backend.model().summary()
+    };
     Ok(session)
 }
 
@@ -852,7 +1037,7 @@ mod tests {
     #[test]
     fn selected_person_drives_address_and_phone_rows() {
         let mock = find_mock_dir().expect("mock dir");
-        let backend = MockBackend::open_default().unwrap();
+        let backend = AppBackend::Mock(MockBackend::open_default().unwrap());
         let file = default_workspace(backend.model());
         let mut session = Session {
             backend,
@@ -863,7 +1048,7 @@ mod tests {
             palette: PaletteState::closed(),
             menu: None,
             chooser_for: None,
-            chooser_filter: String::new(),
+            chooser_filter: TextEdit::new(),
             dock_hover: None,
             pending_dock: None,
         };
@@ -886,11 +1071,54 @@ mod tests {
         assert!(next_addresses.iter().all(|row| row.id.starts_with(&format!("{second}::"))));
         assert_ne!(addresses[0].id, next_addresses.first().map(|r| r.id.as_str()).unwrap_or(""));
     }
+
+    #[test]
+    fn palette_edits_text_and_lists_open_view() {
+        let backend = AppBackend::Mock(MockBackend::open_default().unwrap());
+        let file = default_workspace(backend.model());
+        let mut session = Session {
+            backend,
+            file,
+            workspace_path: PathBuf::from("workspace.json"),
+            data_path: None,
+            status: String::new(),
+            palette: PaletteState::closed(),
+            menu: None,
+            chooser_for: None,
+            chooser_filter: TextEdit::new(),
+            dock_hover: None,
+            pending_dock: None,
+        };
+        session.perform("palette.open");
+        session.type_char('o');
+        session.type_char('p');
+        session.move_home(false);
+        session.move_right(false);
+        session.type_char(' ');
+        assert_eq!(session.palette.query(), "o p");
+        session.move_end(false);
+        session.backspace();
+        assert_eq!(session.palette.query(), "o ");
+        session.select_all_text();
+        session.type_char('a');
+        assert_eq!(session.palette.query(), "a");
+        session.move_home(false);
+        session.delete_forward();
+        assert!(session.palette.query().is_empty());
+        session.perform("view.open");
+        let choices = session.open_view_choices("");
+        assert!(choices.iter().any(|(kind, id, _)| *kind == ViewKind::Table && id == "c360.person.PostalAddress"));
+        assert!(choices.iter().any(|(kind, id, _)| *kind == ViewKind::Detail && id == "c360.person"));
+        assert!(choices.iter().all(|(kind, id, _)| !(*kind == ViewKind::Tree && id == "c360.person")));
+        assert!(session.palette_rows().iter().any(|row| row.title.contains("Open view") || row.title.starts_with("Table")));
+    }
 }
 
 fn help_text() -> String {
     "idmc-client [--export DIR|ZIP] [--model FILE --data FILE] [--values FILE] [--workspace FILE]\n\
-     Default model: mock/idmc-export/person (Customer 360 Person).\n\
+     [--backend mock|live] [--check-login] [--debug-dump FILE]\n\
+     Default model: mock/idmc-export/person (Customer 360 Person). Default backend: mock.\n\
+     Live reads use IDMC_LOGIN_URL, IDMC_USERNAME, and IDMC_PASSWORD from .env.\n\
      Second sample: --export mock/idmc-export/item\n\
      Hand-written model: --model mock/sample/model.json"
         .into()

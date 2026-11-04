@@ -123,15 +123,40 @@ impl Node {
     pub fn move_view(&mut self, v: &str, target: &str, zone: Zone) -> Result<(), String> {
         if v == target && zone == Zone::Center { return Ok(()); }
         if !self.contains(target) { return Err(format!("view {target} not in layout")); }
+        // Dropping a tab onto its own pane (the usual case: the pane's drop
+        // target is the active tab, which is the one being dragged) has to
+        // split against a sibling tab. Removing `v` first would delete the
+        // target and the move would roll back.
+        let dock_on = if v == target {
+            self.sibling_in_pane(v).ok_or_else(|| "cannot dock a view onto itself".to_string())?
+        } else {
+            target.to_string()
+        };
         let snapshot = self.clone();
         self.remove(v);
-        if !self.contains(target) {
-            // target was the only tab together with v; re-dock relative to root
-            *self = snapshot; return Err("cannot dock a view onto itself".into());
+        if !self.contains(&dock_on) || !self.insert(&dock_on, v, zone) {
+            *self = snapshot;
+            return Err("cannot dock a view onto itself".into());
         }
-        self.insert(target, v, zone);
         self.normalize();
+        self.activate(v);
         Ok(())
+    }
+
+    /// Another tab in the same pane as `v`, preferring one that stays behind when `v` leaves.
+    fn sibling_in_pane(&self, v: &str) -> Option<String> {
+        match self {
+            Node::Tabs { views, active } if views.iter().any(|x| x == v) => {
+                if let Some(current) = views.get(*active) {
+                    if current != v {
+                        return Some(current.clone());
+                    }
+                }
+                views.iter().find(|x| x.as_str() != v).cloned()
+            }
+            Node::Tabs { .. } => None,
+            Node::Split { children, .. } => children.iter().find_map(|c| c.sibling_in_pane(v)),
+        }
     }
 
     pub fn swap(&mut self, a: &str, b: &str) {
@@ -240,6 +265,40 @@ mod tests {
         assert!(matches!(n, Node::Tabs { .. }));
         n.swap("a", "c");
         assert_eq!(n.views(), vec!["c", "a"]);
+    }
+
+    #[test]
+    fn dock_active_tab_to_the_right_splits_the_pane() {
+        let mut n = Node::Tabs {
+            views: vec!["addresses".into(), "phones".into(), "emails".into()],
+            active: 1,
+        };
+        n.move_view("phones", "phones", Zone::Right).unwrap();
+        match &n {
+            Node::Split { dir: Dir::Horizontal, children, .. } => {
+                match &children[0] {
+                    Node::Tabs { views, .. } => {
+                        assert!(views.contains(&"addresses".to_string()));
+                        assert!(views.contains(&"emails".to_string()));
+                        assert!(!views.contains(&"phones".to_string()));
+                    }
+                    other => panic!("left pane should stay a tab group, got {other:?}"),
+                }
+                match &children[1] {
+                    Node::Tabs { views, active } => {
+                        assert_eq!(views, &vec!["phones".to_string()]);
+                        assert_eq!(*active, 0);
+                    }
+                    other => panic!("phones should be alone on the right, got {other:?}"),
+                }
+            }
+            other => panic!("expected a horizontal split, got {other:?}"),
+        }
+        let mut alone = Node::tabs("phones");
+        assert!(alone.move_view("phones", "phones", Zone::Right).is_err());
+        assert_eq!(alone.views(), vec!["phones".to_string()]);
+        alone.move_view("phones", "phones", Zone::Center).unwrap();
+        assert_eq!(alone.views(), vec!["phones".to_string()]);
     }
 
     #[test]
