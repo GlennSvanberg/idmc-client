@@ -85,6 +85,7 @@ pub struct Root {
     pub session: Session,
     pub focus: FocusHandle,
     pub dirty: bool,
+    pub(crate) graph_pane: std::cell::RefCell<Option<gpui::Entity<crate::graph::GraphPane>>>,
 }
 
 impl Root {
@@ -96,18 +97,15 @@ impl Root {
                     .update(cx, |root, cx| {
                         let loaded = root.session.backend.poll();
                         let extra = root.session.absorb_async();
-                        let moving = root.session.graph.as_ref().is_some_and(|board| !board.settled());
-                        if moving {
-                            for _ in 0..12 {
-                                if !root.session.tick_graph() {
-                                    break;
-                                }
-                            }
-                        }
                         if loaded {
                             root.session.reconcile();
                         }
-                        if loaded || extra || moving {
+                        if extra {
+                            if let Some(pane) = root.graph_pane.borrow().clone() {
+                                pane.update(cx, |_, cx| cx.notify());
+                            }
+                        }
+                        if loaded || extra {
                             cx.notify();
                         }
                     })
@@ -122,6 +120,7 @@ impl Root {
             session,
             focus: cx.focus_handle(),
             dirty: false,
+            graph_pane: std::cell::RefCell::new(None),
         }
     }
 
@@ -333,7 +332,7 @@ impl Root {
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(theme.hover)))
                     .child(div().flex_1().child(row.title.clone()))
-                    .child(div().text_size(px(11.)).text_color(rgb(theme.subtle)).child(if row.hit.is_some() { row.detail.clone() } else { row.shortcut.clone() }))
+                    .child(div().text_size(px(11.)).text_color(rgb(if on { theme.text } else { theme.muted })).child(if row.hit.is_some() { row.detail.clone() } else { row.shortcut.clone() }))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.session.palette.cursor = index;
                         let effect = this.session.confirm_palette();
@@ -571,8 +570,9 @@ impl Root {
                 .flex()
                 .items_center()
                 .cursor_pointer()
-                .text_color(rgb(theme.accent))
-                .child("+")
+                .text_color(rgb(theme.text))
+                .tooltip(crate::icons::tooltip("New workspace", *theme))
+                .child(crate::icons::icon("plus").w(px(14.)).h(px(14.)).text_color(rgb(theme.accent)))
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.exec("workspace.new", cx);
                 })),
@@ -643,7 +643,7 @@ impl Root {
 }
 
 pub fn run(session: Session) {
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(crate::icons::IconAssets).run(move |cx: &mut App| {
         bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
         cx.open_window(

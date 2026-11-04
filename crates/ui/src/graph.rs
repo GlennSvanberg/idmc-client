@@ -5,9 +5,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use gpui::{
-    canvas, div, point, px, quad, size, AnyElement, BorderStyle, Bounds, Context, Corners, Edges,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Window,
+    canvas, div, point, px, quad, size, AnyElement, App, BorderStyle, Bounds, Context, Corners,
+    Edges, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, TextRun, WeakEntity,
+    Window,
 };
 use gpui::prelude::*;
 use idmc_backend::Backend;
@@ -176,16 +177,21 @@ impl GraphBoard {
             Drag::Node { id, last_x, last_y, moved } => {
                 let dx = x - last_x;
                 let dy = y - last_y;
-                let moved = *moved || dx.hypot(dy) > 3.0;
+                let started = !*moved && dx.hypot(dy) > 3.0;
+                let moved = *moved || started;
                 let id = id.clone();
-                if let Some(node) = self.sim.nodes.iter_mut().find(|node| node.id == id) {
-                    let (wx, wy) = ((x - self.cam_x) / self.cam_k, (y - self.cam_y) / self.cam_k);
-                    node.fx = Some(wx);
-                    node.fy = Some(wy);
-                    node.x = wx;
-                    node.y = wy;
+                if moved {
+                    if let Some(node) = self.sim.nodes.iter_mut().find(|node| node.id == id) {
+                        let (wx, wy) = ((x - self.cam_x) / self.cam_k, (y - self.cam_y) / self.cam_k);
+                        node.fx = Some(wx);
+                        node.fy = Some(wy);
+                        node.x = wx;
+                        node.y = wy;
+                    }
+                    if started {
+                        self.sim.reheat(0.3);
+                    }
                 }
-                self.sim.reheat(0.3);
                 self.drag = Drag::Node { id, last_x: x, last_y: y, moved };
             }
             Drag::None => {}
@@ -212,6 +218,14 @@ impl GraphBoard {
             node.fy = None;
         }
         self.sim.reheat(0.3);
+    }
+
+    pub fn dragging(&self) -> bool {
+        !matches!(self.drag, Drag::None)
+    }
+
+    pub fn dragging_node(&self) -> bool {
+        matches!(self.drag, Drag::Node { moved: true, .. })
     }
 
     pub fn pinned(&self) -> bool {
@@ -330,13 +344,17 @@ pub fn label_visible(priority: u8, zoom: f32) -> bool {
     if priority >= 5 {
         return true;
     }
-    if zoom < 0.5 {
-        return priority >= 2;
-    }
-    if zoom < 0.7 {
-        return priority >= 1;
+    // Only a very far zoom hides leaves. Overlap does the rest.
+    if zoom < 0.35 {
+        return priority >= 3;
     }
     true
+}
+
+/// How many force steps to run on one frame. One step keeps a 400-node scene
+/// inside a frame; a small scene can take two.
+pub fn ticks_per_frame(nodes: usize) -> usize {
+    if nodes > 180 { 1 } else { 2 }
 }
 
 #[derive(Clone, Debug)]
@@ -355,10 +373,11 @@ pub fn visible_labels(boxes: &[LabelBox], zoom: f32) -> BTreeSet<String> {
     let mut kept: Vec<LabelBox> = Vec::new();
     let mut ids = BTreeSet::new();
     for box_ in sorted {
-        if !label_visible(box_.priority, zoom) {
+        let forced = box_.priority >= 5;
+        if !forced && !label_visible(box_.priority, zoom) {
             continue;
         }
-        if kept.iter().any(|other| overlaps(other, &box_)) {
+        if !forced && kept.iter().any(|other| overlaps(other, &box_)) {
             continue;
         }
         ids.insert(box_.id.clone());
@@ -494,114 +513,28 @@ impl Session {
         }
     }
 }
-
 impl Root {
-    pub fn render_graph(&self, id: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let Some(board) = self.session.graph.as_ref() else {
+    pub fn render_graph(&self, _id: &str, _theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.session.graph.is_none() {
             return div().p_4().child("Graph is empty").into_any_element();
+        }
+        let existing = self.graph_pane.borrow().clone();
+        let pane = if let Some(pane) = existing {
+            pane
+        } else {
+            let root = cx.weak_entity();
+            let pane = cx.new(|_| GraphPane {
+                root,
+                hover: None,
+                shaped: HashMap::new(),
+                origin_x: 0.0,
+                origin_y: 0.0,
+                frame_queued: false,
+            });
+            *self.graph_pane.borrow_mut() = Some(pane.clone());
+            pane
         };
-        let selected = board.selected.clone();
-        let neighbors = neighbor_keys(board, selected.as_deref());
-        let mut stage = div()
-            .id("graph-stage")
-            .flex_1()
-            .min_h_0()
-            .relative()
-            .overflow_hidden()
-            .bg(gpui::rgb(theme.bg))
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                let (x, y) = this.graph_local(event.position);
-                let effect = this.session.graph.as_mut().map(|board| board.pointer_down(x, y, event.click_count)).unwrap_or(GraphEffect::None);
-                this.apply_graph_effect(effect);
-                cx.stop_propagation();
-                cx.notify();
-            }))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                let (x, y) = this.graph_local(event.position);
-                if let Some(board) = this.session.graph.as_mut() {
-                    board.pointer_move(x, y);
-                }
-                cx.notify();
-            }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                if let Some(board) = this.session.graph.as_mut() {
-                    board.pointer_up();
-                }
-                cx.notify();
-            }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                let (x, y) = this.graph_local(event.position);
-                let zoom_in = match event.delta {
-                    ScrollDelta::Pixels(point) => f32::from(point.y) > 0.0,
-                    ScrollDelta::Lines(point) => point.y > 0.0,
-                };
-                if let Some(board) = this.session.graph.as_mut() {
-                    board.zoom_at(x, y, zoom_in);
-                }
-                cx.stop_propagation();
-                cx.notify();
-            }));
-        let theme_paint = *theme;
-        let _ = id;
-        let paint_board = PaintSnap::from(board, &neighbors, &selected);
-        let origin = cx.weak_entity();
-        stage = stage.child(canvas(
-            {
-                let origin = origin.clone();
-                move |bounds: Bounds<Pixels>, window, cx| {
-                    let _ = window;
-                    origin.update(cx, |root, _| {
-                        *root.session.graph_origin.borrow_mut() = (
-                            f32::from(bounds.origin.x),
-                            f32::from(bounds.origin.y),
-                            f32::from(bounds.size.width),
-                            f32::from(bounds.size.height),
-                        );
-                        if let Some(board) = root.session.graph.as_mut() {
-                            let width = f32::from(bounds.size.width);
-                            let height = f32::from(bounds.size.height);
-                            let jumped = (width - board.width).abs() > 48.0 || (height - board.height).abs() > 48.0;
-                            board.width = width;
-                            board.height = height;
-                            if !board.user_camera && jumped {
-                                board.fit(width, height);
-                            }
-                        }
-                    }).ok();
-                    bounds
-                }
-            },
-            move |bounds, _, window, _| {
-                paint_graph(window, bounds, &paint_board, &theme_paint);
-            },
-        ));
-        let labels = label_overlays(board, &neighbors, &selected);
-        for label in labels {
-            stage = stage.child(label);
-        }
-        if board.cam_k > 1.0 {
-            for edge in edge_label_overlays(board, &neighbors) {
-                stage = stage.child(edge);
-            }
-        }
-        let mut column = div().size_full().flex().flex_col().overflow_hidden();
-        column = column.child(self.graph_toolbar(theme, cx));
-        if board.capped() {
-            column = column.child(
-                div().px_3().py_1().text_size(px(12.)).bg(gpui::rgb(theme.warn)).text_color(gpui::rgb(theme.bg)).child("Showing the first 400 nodes"),
-            );
-        }
-        let mut row = div().flex_1().min_h_0().flex().flex_row();
-        row = row.child(stage);
-        if let Some(node) = board.selected_node() {
-            row = row.child(self.graph_inspector(node, board.pinned(), theme, cx));
-        }
-        column.child(row).into_any_element()
-    }
-
-    fn graph_local(&self, position: Point<Pixels>) -> (f32, f32) {
-        let (ox, oy, _, _) = *self.session.graph_origin.borrow();
-        (f32::from(position.x) - ox, f32::from(position.y) - oy)
+        pane.into_any_element()
     }
 
     pub(crate) fn apply_graph_effect(&mut self, effect: GraphEffect) {
@@ -611,11 +544,234 @@ impl Root {
             GraphEffect::Open(entity, id) => self.session.open_record(&entity, &id),
         }
     }
+}
 
-    fn graph_toolbar(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let board = self.session.graph.as_ref();
-        let mut bar = div().px_2().h(px(36.)).flex().flex_row().items_center().gap_2().border_b_1().border_color(gpui::rgb(theme.border));
-        let searching = self.session.graph_query;
+pub struct GraphPane {
+    root: WeakEntity<Root>,
+    hover: Option<String>,
+    shaped: HashMap<(String, u16, u32), ShapedLine>,
+    origin_x: f32,
+    origin_y: f32,
+    frame_queued: bool,
+}
+
+impl GraphPane {
+    fn update_root<R>(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut Root, &mut Context<Root>) -> R) -> Option<R> {
+        let root = self.root.upgrade()?;
+        Some(root.update(cx, f))
+    }
+
+    fn local(&self, position: Point<Pixels>) -> (f32, f32) {
+        (f32::from(position.x) - self.origin_x, f32::from(position.y) - self.origin_y)
+    }
+
+    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let hover = self.hover.clone();
+        let Some(root) = self.root.upgrade() else { return };
+        let theme_mode = root.read(cx).session.file.theme;
+        let theme = crate::theme::theme(theme_mode);
+        let snap = {
+            let root = root.read(cx);
+            let Some(board) = root.session.graph.as_ref() else { return };
+            PaintSnap::from(board, &hover)
+        };
+        if self.shaped.len() > 1200 {
+            self.shaped.clear();
+        }
+        paint_graph(window, bounds, &snap, &theme, &mut self.shaped, cx);
+    }
+}
+
+impl Render for GraphPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(root) = self.root.upgrade() else {
+            return div().child("Graph closed").into_any_element();
+        };
+        let theme_mode = root.read(cx).session.file.theme;
+        let theme = crate::theme::theme(theme_mode);
+        let (settled, dragging_node, capped, chips, searching, inspected) = {
+            let root = root.read(cx);
+            let board = root.session.graph.as_ref();
+            let chips = board
+                .map(|board| {
+                    let mut seen = BTreeSet::new();
+                    let mut out = Vec::new();
+                    for node in &board.scene.nodes {
+                        if seen.insert(node.kind) {
+                            out.push((node.kind, !board.hidden.contains(&node.kind)));
+                        }
+                    }
+                    out
+                })
+                .unwrap_or_default();
+            let inspected = board.and_then(|board| board.selected_node().cloned().map(|node| (node, board.pinned())));
+            (
+                board.map(|board| board.settled()).unwrap_or(true),
+                board.map(|board| board.dragging_node()).unwrap_or(false),
+                board.map(|board| board.capped()).unwrap_or(false),
+                chips,
+                root.session.graph_query,
+                inspected,
+            )
+        };
+        if root.read(cx).session.graph.is_none() {
+            return div().p_4().child("Graph is empty").into_any_element();
+        }
+        if (!settled || dragging_node) && !self.frame_queued {
+            self.frame_queued = true;
+            cx.on_next_frame(window, |pane, _, cx| {
+                pane.frame_queued = false;
+                pane.update_root(cx, |root, _| {
+                    let count = root.session.graph.as_ref().map(|board| board.sim.nodes.len()).unwrap_or(0);
+                    for _ in 0..ticks_per_frame(count) {
+                        if !root.session.tick_graph() {
+                            break;
+                        }
+                    }
+                    if let Some(board) = root.session.graph.as_mut() {
+                        if board.dragging_node() {
+                            board.sim.alpha = board.sim.alpha.max(0.18);
+                        }
+                    }
+                });
+                cx.notify();
+            });
+        }
+        let pane = cx.entity().downgrade();
+        let pane_paint = pane.clone();
+        let stage = div()
+            .id("graph-stage")
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .overflow_hidden()
+            .bg(gpui::rgb(theme.bg))
+            .on_mouse_down(MouseButton::Left, cx.listener(|pane, event: &MouseDownEvent, _, cx| {
+                let (x, y) = pane.local(event.position);
+                let clicks = event.click_count;
+                let effect = pane
+                    .update_root(cx, |root, _| {
+                        root.session.graph.as_mut().map(|board| board.pointer_down(x, y, clicks)).unwrap_or(GraphEffect::None)
+                    })
+                    .unwrap_or(GraphEffect::None);
+                let opens = matches!(effect, GraphEffect::Open(_, _));
+                pane.update_root(cx, |root, cx| {
+                    root.apply_graph_effect(effect);
+                    if opens {
+                        cx.notify();
+                    }
+                });
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .on_mouse_move(cx.listener(|pane, event: &MouseMoveEvent, _, cx| {
+                let (x, y) = pane.local(event.position);
+                let (dragging, hover) = pane
+                    .update_root(cx, |root, _| {
+                        let Some(board) = root.session.graph.as_mut() else { return (false, None) };
+                        let dragging = board.dragging();
+                        if dragging {
+                            board.pointer_move(x, y);
+                        }
+                        (dragging, board.hit(x, y))
+                    })
+                    .unwrap_or((false, None));
+                let changed = hover != pane.hover;
+                pane.hover = hover;
+                if dragging || changed {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|pane, _: &MouseUpEvent, _, cx| {
+                let was = pane
+                    .update_root(cx, |root, _| {
+                        let was = root.session.graph.as_ref().map(|board| board.dragging()).unwrap_or(false);
+                        if let Some(board) = root.session.graph.as_mut() {
+                            board.pointer_up();
+                        }
+                        was
+                    })
+                    .unwrap_or(false);
+                if was {
+                    cx.notify();
+                }
+            }))
+            .on_scroll_wheel(cx.listener(|pane, event: &ScrollWheelEvent, _, cx| {
+                let (x, y) = pane.local(event.position);
+                let zoom_in = match event.delta {
+                    ScrollDelta::Pixels(point) => f32::from(point.y) > 0.0,
+                    ScrollDelta::Lines(point) => point.y > 0.0,
+                };
+                pane.update_root(cx, |root, _| {
+                    if let Some(board) = root.session.graph.as_mut() {
+                        board.zoom_at(x, y, zoom_in);
+                    }
+                });
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(canvas(
+                {
+                    let pane = pane.clone();
+                    move |bounds: Bounds<Pixels>, _, cx| {
+                        pane.update(cx, |pane, cx| {
+                            pane.origin_x = f32::from(bounds.origin.x);
+                            pane.origin_y = f32::from(bounds.origin.y);
+                            let width = f32::from(bounds.size.width);
+                            let height = f32::from(bounds.size.height);
+                            pane.update_root(cx, |root, _| {
+                                if let Some(board) = root.session.graph.as_mut() {
+                                    let jumped = (width - board.width).abs() > 48.0 || (height - board.height).abs() > 48.0;
+                                    board.width = width;
+                                    board.height = height;
+                                    if !board.user_camera && jumped {
+                                        board.fit(width, height);
+                                    }
+                                }
+                            });
+                        })
+                        .ok();
+                        bounds
+                    }
+                },
+                move |bounds, _, window, cx| {
+                    pane_paint.update(cx, |pane, cx| pane.paint(bounds, window, cx)).ok();
+                },
+            ));
+        let mut column = div().size_full().flex().flex_col().overflow_hidden();
+        column = column.child(self.toolbar(&chips, searching, &theme, cx));
+        if capped {
+            column = column.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(12.))
+                    .bg(gpui::rgb(theme.warn))
+                    .text_color(gpui::rgb(theme.on_node))
+                    .child("Showing the first 400 nodes"),
+            );
+        }
+        let mut row = div().flex_1().min_h_0().flex().flex_row();
+        row = row.child(stage);
+        if let Some((node, pinned)) = inspected {
+            row = row.child(self.inspector(&node, pinned, &theme, cx));
+        }
+        column.child(row).into_any_element()
+    }
+}
+
+impl GraphPane {
+    fn toolbar(&self, chips: &[(NodeKind, bool)], searching: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let root = self.root.clone();
+        let mut bar = div()
+            .px_2()
+            .h(px(36.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(gpui::rgb(theme.border));
         bar = bar.child(
             div()
                 .id("graph-search")
@@ -627,64 +783,57 @@ impl Root {
                 .border_color(gpui::rgb(if searching { theme.accent } else { theme.border }))
                 .text_size(px(12.))
                 .cursor_text()
-                .child(crate::edit::render_edit_line(&self.session.graph_edit, "Search records", theme))
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.session.graph_query = true;
+                .child({
+                    let text = root.upgrade().map(|root| root.read(cx).session.graph_edit.clone());
+                    crate::edit::render_edit_line(&text.unwrap_or_default(), "Search records", theme)
+                })
+                .on_mouse_down(MouseButton::Left, cx.listener(|pane, _: &MouseDownEvent, _, cx| {
+                    pane.update_root(cx, |root, _| root.session.graph_query = true);
                     cx.notify();
                 })),
         );
-        if let Some(board) = board {
-            let mut seen = BTreeSet::new();
-            for node in &board.scene.nodes {
-                if !seen.insert(node.kind) {
-                    continue;
-                }
-                let kind = node.kind;
-                let on = !board.hidden.contains(&kind);
-                let name = kind_name(kind).to_string();
-                bar = bar.child(
-                    div()
-                        .id(SharedString::from(format!("legend-{name}")))
-                        .px_2()
-                        .py(px(2.))
-                        .rounded_sm()
-                        .text_size(px(11.))
-                        .cursor_pointer()
-                        .bg(gpui::rgb(if on { kind_fill(kind, theme) } else { theme.raised }))
-                        .text_color(gpui::rgb(if on && kind == NodeKind::Entity { theme.bg } else { theme.text }))
-                        .child(name)
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            if let Some(board) = this.session.graph.as_mut() {
+        for (kind, on) in chips {
+            let kind = *kind;
+            let on = *on;
+            let name = kind_name(kind).to_string();
+            let fill = kind_fill(kind, theme);
+            bar = bar.child(
+                div()
+                    .id(SharedString::from(format!("legend-{name}")))
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_sm()
+                    .text_size(px(11.))
+                    .cursor_pointer()
+                    .bg(gpui::rgb(if on { fill } else { theme.raised }))
+                    .text_color(gpui::rgb(if on { theme.on_node } else { theme.text }))
+                    .child(name)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |pane, _: &MouseDownEvent, _, cx| {
+                        pane.update_root(cx, |root, _| {
+                            if let Some(board) = root.session.graph.as_mut() {
                                 board.toggle_kind(kind);
                             }
-                            cx.stop_propagation();
-                            cx.notify();
-                        })),
-                );
-            }
+                        });
+                        cx.stop_propagation();
+                        cx.notify();
+                    })),
+            );
         }
         bar = bar.child(div().flex_1());
-        bar.child(
-            div()
-                .id("graph-fit")
-                .px_2()
-                .cursor_pointer()
-                .text_size(px(12.))
-                .text_color(gpui::rgb(theme.accent))
-                .child("Fit")
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    if let Some(board) = this.session.graph.as_mut() {
-                        board.user_camera = false;
-                        let (w, h) = (board.width, board.height);
-                        board.fit(w, h);
-                    }
-                    cx.notify();
-                })),
-        )
+        bar.child(self.icon_button("graph-fit", "fit", "Fit", theme, cx, |pane, cx| {
+            pane.update_root(cx, |root, _| {
+                if let Some(board) = root.session.graph.as_mut() {
+                    board.user_camera = false;
+                    let (w, h) = (board.width, board.height);
+                    board.fit(w, h);
+                }
+            });
+            cx.notify();
+        }))
         .into_any_element()
     }
 
-    fn graph_inspector(&self, node: &GraphNode, pinned: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn inspector(&self, node: &GraphNode, pinned: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mut panel = div()
             .w(px(240.))
             .h_full()
@@ -698,54 +847,66 @@ impl Root {
             .child(div().text_size(px(14.)).child(node.caption.clone()))
             .child(div().text_size(px(11.)).text_color(gpui::rgb(theme.muted)).child(node.subtitle.clone()));
         for prop in &node.properties {
-            panel = panel.child(
-                div().text_size(px(12.)).child(format!("{}: {}", prop.label, prop.value)),
-            );
+            panel = panel.child(div().text_size(px(12.)).child(format!("{}: {}", prop.label, prop.value)));
         }
         let expand_key = node.id.key();
         panel = panel.child(
-            div().flex().flex_row().gap_2().mt_2()
-                .child(self.graph_button("graph-expand", "Expand", theme, cx, move |this, cx| {
-                    this.session.expand_graph(&expand_key);
+            div()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .mt_2()
+                .child(self.icon_button("graph-expand", "expand", "Expand", theme, cx, move |pane, cx| {
+                    pane.update_root(cx, |root, _| root.session.expand_graph(&expand_key));
                     cx.notify();
                 }))
-                .child(self.graph_button("graph-open", "Open", theme, cx, |this, cx| {
-                    if let GraphEffect::Open(entity, id) = this.session.graph_enter() {
-                        this.session.open_record(&entity, &id);
-                    }
+                .child(self.icon_button("graph-open", "open", "Open", theme, cx, |pane, cx| {
+                    pane.update_root(cx, |root, cx| {
+                        if let GraphEffect::Open(entity, id) = root.session.graph_enter() {
+                            root.session.open_record(&entity, &id);
+                            cx.notify();
+                        }
+                    });
                     cx.notify();
                 })),
         );
         if pinned {
-            panel = panel.child(self.graph_button("graph-unpin", "Unpin", theme, cx, |this, cx| {
-                if let Some(board) = this.session.graph.as_mut() {
-                    board.unpin();
-                }
+            panel = panel.child(self.icon_button("graph-unpin", "unpin", "Unpin", theme, cx, |pane, cx| {
+                pane.update_root(cx, |root, _| {
+                    if let Some(board) = root.session.graph.as_mut() {
+                        board.unpin();
+                    }
+                });
                 cx.notify();
             }));
         }
         panel.into_any_element()
     }
 
-    fn graph_button(
+    fn icon_button(
         &self,
         id: &str,
-        label: &str,
+        name: &'static str,
+        tip: &'static str,
         theme: &Theme,
         cx: &mut Context<Self>,
         action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         div()
             .id(SharedString::from(id.to_string()))
-            .px_2()
-            .py(px(2.))
+            .w(px(26.))
+            .h(px(26.))
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded_sm()
             .cursor_pointer()
-            .text_size(px(12.))
-            .bg(gpui::rgb(theme.raised))
-            .child(label.to_string())
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                action(this, cx);
+            .text_color(gpui::rgb(theme.text))
+            .hover(|style| style.bg(gpui::rgb(theme.hover)))
+            .tooltip(crate::icons::tooltip(tip, *theme))
+            .child(crate::icons::icon(name).w(px(15.)).h(px(15.)).text_color(gpui::rgb(theme.text)))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |pane, _: &MouseDownEvent, _, cx| {
+                action(pane, cx);
                 cx.stop_propagation();
             }))
             .into_any_element()
@@ -758,6 +919,8 @@ struct PaintNode {
     x: f32,
     y: f32,
     radius: f32,
+    caption: String,
+    mark: String,
 }
 
 struct PaintSnap {
@@ -766,12 +929,15 @@ struct PaintSnap {
     cam_x: f32,
     cam_y: f32,
     cam_k: f32,
+    width: f32,
+    height: f32,
     selected: Option<String>,
+    hover: Option<String>,
     neighbors: HashSet<String>,
 }
 
 impl PaintSnap {
-    fn from(board: &GraphBoard, neighbors: &HashSet<String>, selected: &Option<String>) -> Self {
+    fn from(board: &GraphBoard, hover: &Option<String>) -> Self {
         let nodes = board
             .sim
             .nodes
@@ -785,6 +951,8 @@ impl PaintSnap {
                     x: body.x,
                     y: body.y,
                     radius: body.radius,
+                    caption: node.caption.clone(),
+                    mark: node_mark(&mark_source(&node.caption)),
                 })
             })
             .collect();
@@ -795,16 +963,162 @@ impl PaintSnap {
             .filter(|edge| board.visible_key(&edge.source) && board.visible_key(&edge.target))
             .map(|edge| (edge.source.clone(), edge.target.clone(), edge.label.clone()))
             .collect();
+        let neighbors = neighbor_keys(board, board.selected.as_deref());
         Self {
             nodes,
             edges,
             cam_x: board.cam_x,
             cam_y: board.cam_y,
             cam_k: board.cam_k,
-            selected: selected.clone(),
-            neighbors: neighbors.clone(),
+            width: board.width,
+            height: board.height,
+            selected: board.selected.clone(),
+            hover: hover.clone(),
+            neighbors,
         }
     }
+}
+
+fn paint_graph(window: &mut Window, bounds: Bounds<Pixels>, snap: &PaintSnap, theme: &Theme, cache: &mut HashMap<(String, u16, u32), ShapedLine>, cx: &mut App) {
+    let origin_x = f32::from(bounds.origin.x);
+    let origin_y = f32::from(bounds.origin.y);
+    let screen = |x: f32, y: f32| (origin_x + snap.cam_x + x * snap.cam_k, origin_y + snap.cam_y + y * snap.cam_k);
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(snap.nodes.len());
+    for (i, node) in snap.nodes.iter().enumerate() {
+        index.insert(node.key.as_str(), i);
+    }
+    for (source, target, label) in &snap.edges {
+        let Some(&from_i) = index.get(source.as_str()) else { continue };
+        let Some(&to_i) = index.get(target.as_str()) else { continue };
+        let from = &snap.nodes[from_i];
+        let to = &snap.nodes[to_i];
+        let (x1, y1) = screen(from.x, from.y);
+        let (x2, y2) = screen(to.x, to.y);
+        let hot = snap.neighbors.contains(source) || snap.neighbors.contains(target);
+        let color = if hot { theme.edge } else { theme.muted };
+        let mut path = PathBuilder::stroke(px(if hot { 1.8 } else { 1.25 }));
+        path.move_to(point(px(x1), px(y1)));
+        let mx = (x1 + x2) * 0.5;
+        let my = (y1 + y2) * 0.5;
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+        let len = dx.hypot(dy).max(1.0);
+        let bend = 18.0_f32.min(len * 0.12);
+        path.curve_to(point(px(x2), px(y2)), point(px(mx - dy / len * bend), px(my + dx / len * bend)));
+        if let Ok(path) = path.build() {
+            window.paint_path(path, gpui::rgb(color));
+        }
+        arrow(window, x1, y1, x2, y2, to.radius * snap.cam_k, color);
+        if snap.cam_k > 1.0 && !label.is_empty() && (snap.neighbors.is_empty() || hot) {
+            paint_cached(cache, window, cx, label, 10.0, theme.text, mx, my - 8.0);
+        }
+    }
+    let mut boxes = Vec::new();
+    for node in &snap.nodes {
+        let (x, y) = screen(node.x, node.y);
+        let radius = node.radius * snap.cam_k;
+        if x < origin_x - 80.0 || y < origin_y - 80.0 || x > origin_x + snap.width + 80.0 || y > origin_y + snap.height + 80.0 {
+            continue;
+        }
+        let active = snap.selected.as_deref() == Some(node.key.as_str())
+            || snap.hover.as_deref() == Some(node.key.as_str())
+            || snap.neighbors.contains(&node.key);
+        let width = (node.caption.chars().count().min(42) as f32) * 6.6 + 8.0;
+        boxes.push(LabelBox {
+            id: node.key.clone(),
+            priority: label_priority(node.kind, active),
+            left: x - width * 0.5,
+            right: x + width * 0.5,
+            top: y + radius + 2.0,
+            bottom: y + radius + 16.0,
+        });
+    }
+    let shown = visible_labels(&boxes, snap.cam_k);
+    for node in &snap.nodes {
+        let (x, y) = screen(node.x, node.y);
+        let radius = node.radius * snap.cam_k;
+        let selected = snap.selected.as_deref() == Some(node.key.as_str());
+        let hovered = snap.hover.as_deref() == Some(node.key.as_str());
+        let neighbor = snap.neighbors.contains(&node.key);
+        let fill = kind_fill(node.kind, theme);
+        let (border, width) = if selected {
+            (theme.text, 3.0)
+        } else if hovered {
+            (theme.accent, 2.5)
+        } else if neighbor && snap.selected.is_some() {
+            (theme.accent, 2.0)
+        } else {
+            (theme.bg, 1.5)
+        };
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(px(x - radius), px(y - radius)),
+                size: size(px(radius * 2.0), px(radius * 2.0)),
+            },
+            Corners::all(px(radius)),
+            gpui::rgb(fill),
+            Edges::all(px(width)),
+            gpui::rgb(border),
+            BorderStyle::Solid,
+        ));
+        if radius >= 9.0 && !node.mark.is_empty() {
+            paint_cached(cache, window, cx, &node.mark, 11.0, theme.on_node, x, y - 6.0);
+        }
+        if shown.contains(&node.key) {
+            let caption = clip_caption(&node.caption);
+            paint_cached(cache, window, cx, &caption, 12.0, theme.text, x, y + radius + 1.0);
+        }
+    }
+}
+
+fn mark_source(caption: &str) -> String {
+    match caption.rsplit_once(" (") {
+        Some((name, rest)) if rest.ends_with(')') && rest[..rest.len() - 1].chars().all(|ch| ch.is_ascii_digit()) => name.to_string(),
+        _ => caption.to_string(),
+    }
+}
+
+fn clip_caption(caption: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in caption.chars().enumerate() {
+        if index == 42 {
+            out.push('…');
+            break;
+        }
+        if ch == '\n' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn paint_cached(cache: &mut HashMap<(String, u16, u32), ShapedLine>, window: &mut Window, cx: &mut App, text: &str, size: f32, color: u32, x: f32, y: f32) {
+    if text.is_empty() {
+        return;
+    }
+    let key = (text.to_string(), (size * 10.0) as u16, color);
+    if !cache.contains_key(&key) {
+        let shaped = shape_line(window, text, size, color);
+        cache.insert(key.clone(), shaped);
+    }
+    let Some(line) = cache.get(&key) else { return };
+    let width = f32::from(line.width);
+    line.paint(point(px(x - width * 0.5), px(y)), px(size + 3.0), window, cx).ok();
+}
+
+fn shape_line(window: &mut Window, text: &str, size: f32, color: u32) -> ShapedLine {
+    let text = SharedString::from(text.replace('\n', " "));
+    let run = TextRun {
+        len: text.len(),
+        font: window.text_style().font(),
+        color: gpui::rgb(color).into(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window.text_system().shape_line(text, px(size), &[run], None)
 }
 
 fn neighbor_keys(board: &GraphBoard, selected: Option<&str>) -> HashSet<String> {
@@ -820,54 +1134,6 @@ fn neighbor_keys(board: &GraphBoard, selected: Option<&str>) -> HashSet<String> 
         }
     }
     keys
-}
-
-fn paint_graph(window: &mut Window, bounds: Bounds<Pixels>, snap: &PaintSnap, theme: &Theme) {
-    let origin_x = f32::from(bounds.origin.x);
-    let origin_y = f32::from(bounds.origin.y);
-    let screen = |x: f32, y: f32| (origin_x + snap.cam_x + x * snap.cam_k, origin_y + snap.cam_y + y * snap.cam_k);
-    let highlight = !snap.neighbors.is_empty();
-    for (source, target, _label) in &snap.edges {
-        let Some(from) = snap.nodes.iter().find(|node| &node.key == source) else { continue };
-        let Some(to) = snap.nodes.iter().find(|node| &node.key == target) else { continue };
-        let (x1, y1) = screen(from.x, from.y);
-        let (x2, y2) = screen(to.x, to.y);
-        let emphasized = !highlight || snap.neighbors.contains(source) || snap.neighbors.contains(target);
-        let color = if emphasized { theme.muted } else { theme.border };
-        let mut path = PathBuilder::stroke(px(if emphasized { 1.6 } else { 1.0 }));
-        path.move_to(point(px(x1), px(y1)));
-        let mx = (x1 + x2) * 0.5;
-        let my = (y1 + y2) * 0.5;
-        let dx = x2 - x1;
-        let dy = y2 - y1;
-        let len = dx.hypot(dy).max(1.0);
-        let bend = 18.0_f32.min(len * 0.12);
-        path.curve_to(point(px(x2), px(y2)), point(px(mx - dy / len * bend), px(my + dx / len * bend)));
-        if let Ok(path) = path.build() {
-            window.paint_path(path, gpui::rgb(color));
-        }
-        arrow(window, x1, y1, x2, y2, to.radius * snap.cam_k, color);
-    }
-    for node in &snap.nodes {
-        let (x, y) = screen(node.x, node.y);
-        let radius = node.radius * snap.cam_k;
-        let emphasized = !highlight || snap.neighbors.contains(&node.key);
-        let fill = if emphasized { kind_fill(node.kind, theme) } else { theme.border };
-        let selected = snap.selected.as_deref() == Some(node.key.as_str());
-        let border = if selected { theme.text } else { theme.bg };
-        let width = if selected { 3.0 } else { 2.0 };
-        window.paint_quad(quad(
-            Bounds {
-                origin: point(px(x - radius), px(y - radius)),
-                size: size(px(radius * 2.0), px(radius * 2.0)),
-            },
-            Corners::all(px(radius)),
-            gpui::rgb(fill),
-            Edges::all(px(width)),
-            gpui::rgb(border),
-            BorderStyle::Solid,
-        ));
-    }
 }
 
 fn arrow(window: &mut Window, x1: f32, y1: f32, x2: f32, y2: f32, radius: f32, color: u32) {
@@ -892,94 +1158,6 @@ fn arrow(window: &mut Window, x1: f32, y1: f32, x2: f32, y2: f32, radius: f32, c
     }
 }
 
-fn label_overlays(board: &GraphBoard, neighbors: &HashSet<String>, selected: &Option<String>) -> Vec<AnyElement> {
-    let mut boxes = Vec::new();
-    let mut placed = Vec::new();
-    for body in &board.sim.nodes {
-        if !board.visible_key(&body.id) {
-            continue;
-        }
-        let Some(node) = board.scene.nodes.iter().find(|node| node.id.key() == body.id) else { continue };
-        let x = board.cam_x + body.x * board.cam_k;
-        let y = board.cam_y + body.y * board.cam_k;
-        let radius = body.radius * board.cam_k;
-        if x < -40.0 || y < -40.0 || x > board.width + 40.0 || y > board.height + 40.0 {
-            continue;
-        }
-        let active = selected.as_deref() == Some(body.id.as_str()) || neighbors.contains(&body.id);
-        let width = node.caption.chars().count() as f32 * 6.4 + 8.0;
-        boxes.push(LabelBox {
-            id: body.id.clone(),
-            priority: label_priority(node.kind, active),
-            left: x - width * 0.5,
-            right: x + width * 0.5,
-            top: y + radius + 2.0,
-            bottom: y + radius + 16.0,
-        });
-        placed.push((body.id.clone(), node.caption.clone(), node_mark(&node.caption), x, y, radius));
-    }
-    let shown = visible_labels(&boxes, board.cam_k);
-    let mut out = Vec::new();
-    for (id, caption, mark, x, y, radius) in placed {
-        if radius >= 10.0 && !mark.is_empty() {
-            out.push(
-                div()
-                    .absolute()
-                    .left(px(x - 14.0))
-                    .top(px(y - 8.0))
-                    .w(px(28.))
-                    .text_size(px(11.))
-                    .text_center()
-                    .child(mark)
-                    .into_any_element(),
-            );
-        }
-        if shown.contains(&id) {
-            out.push(
-                div()
-                    .absolute()
-                    .left(px(x - 70.0))
-                    .top(px(y + radius + 2.0))
-                    .w(px(140.))
-                    .text_size(px(11.))
-                    .text_center()
-                    .child(caption)
-                    .into_any_element(),
-            );
-        }
-    }
-    out
-}
-
-fn edge_label_overlays(board: &GraphBoard, neighbors: &HashSet<String>) -> Vec<AnyElement> {
-    let mut out = Vec::new();
-    let highlight = !neighbors.is_empty();
-    for edge in &board.scene.edges {
-        if edge.label.is_empty() || !board.visible_key(&edge.source) || !board.visible_key(&edge.target) {
-            continue;
-        }
-        if highlight && !neighbors.contains(&edge.source) && !neighbors.contains(&edge.target) {
-            continue;
-        }
-        let Some((x1, y1)) = board.position(&edge.source) else { continue };
-        let Some((x2, y2)) = board.position(&edge.target) else { continue };
-        let x = board.cam_x + (x1 + x2) * 0.5 * board.cam_k;
-        let y = board.cam_y + (y1 + y2) * 0.5 * board.cam_k - 8.0;
-        out.push(
-            div()
-                .absolute()
-                .left(px(x - 40.0))
-                .top(px(y))
-                .w(px(80.))
-                .text_size(px(10.))
-                .text_center()
-                .child(edge.label.clone())
-                .into_any_element(),
-        );
-    }
-    out
-}
-
 fn kind_name(kind: NodeKind) -> &'static str {
     match kind {
         NodeKind::Entity => "Entity",
@@ -992,11 +1170,11 @@ fn kind_name(kind: NodeKind) -> &'static str {
 
 fn kind_fill(kind: NodeKind, theme: &Theme) -> u32 {
     match kind {
-        NodeKind::Entity => theme.accent,
-        NodeKind::Type => 0x7aa2ff,
-        NodeKind::ChildGroup => 0x3cb4d8,
-        NodeKind::ChildRecord => theme.ok,
-        NodeKind::Field => theme.warn,
+        NodeKind::Entity => theme.node_entity,
+        NodeKind::Type => theme.node_type,
+        NodeKind::ChildGroup => theme.node_group,
+        NodeKind::ChildRecord => theme.node_child,
+        NodeKind::Field => theme.node_field,
     }
 }
 
@@ -1068,6 +1246,38 @@ mod tests {
         board.arrow("right");
         assert_ne!(board.selected, None);
         let _ = first;
+    }
+
+    #[test]
+    fn labels_show_unless_they_overlap_and_active_ones_stay() {
+        let mut boxes = Vec::new();
+        for index in 0..8 {
+            boxes.push(LabelBox {
+                id: format!("n{index}"),
+                priority: 1,
+                left: index as f32 * 80.0,
+                right: index as f32 * 80.0 + 40.0,
+                top: 0.0,
+                bottom: 14.0,
+            });
+        }
+        boxes.push(LabelBox {
+            id: "covered".into(),
+            priority: 5,
+            left: 0.0,
+            right: 40.0,
+            top: 0.0,
+            bottom: 14.0,
+        });
+        let shown = visible_labels(&boxes, 1.0);
+        assert!(shown.contains("covered"));
+        assert!(!shown.contains("n0"), "the label under the selected one yields");
+        assert_eq!(shown.len(), 8);
+        let far = visible_labels(&boxes, 0.2);
+        assert!(far.contains("covered"));
+        assert!(far.len() < shown.len());
+        assert_eq!(ticks_per_frame(40), 2);
+        assert_eq!(ticks_per_frame(400), 1);
     }
 
     #[test]

@@ -129,10 +129,11 @@ impl Root {
                     .mb(px(4.))
                     .px_2()
                     .rounded_sm()
-                    .text_color(rgb(theme.subtle))
+                    .text_color(rgb(theme.text))
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme.hover)).text_color(rgb(theme.text)))
-                    .child("+")
+                    .hover(|style| style.bg(rgb(theme.hover)))
+                    .tooltip(crate::icons::tooltip("New view", *theme))
+                    .child(crate::icons::icon("plus").w(px(14.)).h(px(14.)).text_color(rgb(theme.text)))
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         this.open_add_menu(&add_target, event.position);
                         cx.stop_propagation();
@@ -146,10 +147,11 @@ impl Root {
                     .mb(px(4.))
                     .px_2()
                     .rounded_sm()
-                    .text_color(rgb(theme.subtle))
+                    .text_color(rgb(theme.text))
                     .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme.hover)).text_color(rgb(theme.text)))
-                    .child("···")
+                    .hover(|style| style.bg(rgb(theme.hover)))
+                    .tooltip(crate::icons::tooltip("View menu", *theme))
+                    .child(crate::icons::icon("ellipsis").w(px(14.)).h(px(14.)).text_color(rgb(theme.text)))
                     .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         this.open_view_menu(&menu_target, event.position);
                         cx.stop_propagation();
@@ -164,9 +166,10 @@ impl Root {
                     .px_2()
                     .rounded_sm()
                     .cursor_pointer()
-                    .text_color(rgb(if zoomed { theme.accent } else { theme.subtle }))
-                    .hover(|style| style.bg(rgb(theme.hover)).text_color(rgb(theme.text)))
-                    .child(if zoomed { "Restore" } else { "Max" })
+                    .text_color(rgb(if zoomed { theme.accent } else { theme.text }))
+                    .hover(|style| style.bg(rgb(theme.hover)))
+                    .tooltip(crate::icons::tooltip(if zoomed { "Restore" } else { "Maximize" }, *theme))
+                    .child(crate::icons::icon(if zoomed { "minimize" } else { "maximize" }).w(px(14.)).h(px(14.)).text_color(rgb(if zoomed { theme.accent } else { theme.text })))
                     .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
                         this.session.file.focus = Some(zoom_target.clone());
                         this.exec("view.zoom", cx);
@@ -199,8 +202,8 @@ impl Root {
             .flex()
             .flex_col()
             .bg(rgb(theme.panel))
-            .border_1()
-            .border_color(rgb(if focused { theme.accent_dim } else { theme.panel }))
+            .border_2()
+            .border_color(rgb(if focused { theme.accent } else { theme.panel }))
             .rounded_md()
             .child(tabs)
             .child(body)
@@ -306,9 +309,10 @@ impl Root {
                 div()
                     .id(SharedString::from(format!("x-{id}")))
                     .px(px(4.))
-                    .text_color(rgb(theme.subtle))
-                    .hover(|style| style.text_color(rgb(theme.text)))
-                    .child("×")
+                    .text_color(rgb(theme.text))
+                    .hover(|style| style.bg(rgb(theme.hover)))
+                    .tooltip(crate::icons::tooltip("Close", *theme))
+                    .child(crate::icons::icon("x").w(px(12.)).h(px(12.)).text_color(rgb(theme.text)))
                     .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
                         this.session.close_view(&close_id);
                         this.session.status = this.session.save().unwrap_or_else(|err| err);

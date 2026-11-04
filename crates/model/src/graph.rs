@@ -253,17 +253,19 @@ pub fn build_entity_scene(record: &Record, model: &ModelDefinition) -> Scene {
             field: embedded.field.clone(),
         };
         let group_key = group.key();
+        let rows = child_rows(record, &embedded.field, &child.id);
+        let caption = format!("{} ({})", child.label, rows.len());
         scene.nodes.push(GraphNode {
             id: group,
             kind: NodeKind::ChildGroup,
-            caption: child.label.clone(),
+            caption,
             subtitle: child.label_plural.clone(),
             properties: vec![prop("Collection", &child.label), prop("Field", &embedded.field), prop("Parent", &entity.label)],
             be_type: child.id.clone(),
             raw_caption: false,
         });
         scene.edges.push(edge(&self_key, &child.label, &group_key));
-        for row in child_rows(record, &embedded.field, &child.id) {
+        for row in rows {
             let label = compose_label(child, &row.values, model).unwrap_or_else(|| child.label.clone());
             let node = NodeId::ChildRecord { be: child.id.clone(), id: row.id.clone() };
             let key = node.key();
@@ -616,7 +618,10 @@ mod tests {
         let groups: Vec<_> = model.embedded_children(&record.entity).map(|child| child.label.clone()).collect();
         assert!(groups.len() >= 3, "{groups:?}");
         for label in &groups {
-            assert!(scene.nodes.iter().any(|node| node.kind == NodeKind::ChildGroup && node.caption == *label), "missing group {label}");
+            assert!(
+                scene.nodes.iter().any(|node| node.kind == NodeKind::ChildGroup && node.caption.starts_with(label) && node.caption.contains('(')),
+                "missing group {label}"
+            );
         }
         let children = scene.nodes.iter().filter(|node| node.kind == NodeKind::ChildRecord).count();
         assert!(children >= 1, "child records");

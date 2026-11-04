@@ -54,7 +54,10 @@ Ctrl+K searches records as well as commands. Live search waits about 150ms, then
 
 ## Graph view
 
-The graph is a GPUI canvas, not a port of the Braian TypeScript. Force parameters match that Apache-2.0 graph: link distance `72 + r1 + r2` at strength 0.25, many-body charge −560 with a max distance of 820, collision at `r + 4` for two iterations, `alphaDecay` 0.032, `velocityDecay` 0.5. A merge keeps existing coordinates and reheats to 0.3. The scene is built from the loaded model (embedded child groups, then child rows, then reference stubs). Schema mode is one node per root type. Live expand reads `GET /business-entity/public/api/v1/entity/{be}/{id}` when the record is not cached, and dedupes a key that is already in flight. The scene stops at 400 nodes.
+The graph is a GPUI canvas, not a port of the Braian TypeScript. Force parameters match that Apache-2.0 graph: link distance `72 + r1 + r2` at strength 0.25, many-body charge −560 with a max distance of 820, collision at `r + 4` for two iterations, `alphaDecay` 0.032, `velocityDecay` 0.5. A merge keeps existing coordinates and reheats to 0.3. The scene is built from the loaded model (embedded child groups, then child rows, then reference stubs). Schema mode is one node per root type. Live expand reads `GET /business-entity/public/api/v1/entity/{be}/{id}` when the record is not cached, and dedupes a key that is already in flight. The scene stops at 400 nodes. Animation ticks at most twice per frame on the graph view alone, and captions are shaped once and painted on the canvas.
+
+## Open questions
+
 * This Person export has no hierarchy. The tree view works for models that declare one (the sample category tree). It is not invented for Person.
 * Promoting every `allowMany` group to a child entity is the linking model. A group that should stay an inline editor, rather than its own table, is not distinguished yet.
 * Inverse relationships are derived from reference fields. If the export later contains explicit relationships, those should win and the derived inverse should not be duplicated.

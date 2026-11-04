@@ -49,7 +49,7 @@ impl Root {
             .when(self.session.is_master_table(id), |el| {
                 let view = id.to_string();
                 let filtering = self.session.filter_for.as_deref() == Some(id);
-                let mut row = el.child(self.header_button(id, "Filter", theme, cx, move |this, cx| {
+                let mut row = el.child(self.header_button(id, "filter", "Filter", theme, cx, move |this, cx| {
                     let current = this.session.spec(&view).map(|spec| spec.query.clone()).unwrap_or_default();
                     this.session.filter_edit = crate::edit::TextEdit::new();
                     for ch in current.chars() {
@@ -79,7 +79,7 @@ impl Root {
             .child(div().flex_1())
             .when(matches!(kind, Some(ViewKind::Table | ViewKind::Detail)), |el| {
                 let id = menu_id.clone();
-                el.child(self.header_button(&format!("graph-{id}"), "Graph", theme, cx, move |this, cx| {
+                el.child(self.header_button(&format!("graph-{id}"), "graph", "Show in graph", theme, cx, move |this, cx| {
                     this.session.file.focus = Some(id.clone());
                     this.exec("record.show_in_graph", cx);
                 }))
@@ -87,12 +87,12 @@ impl Root {
             .when(kind == Some(ViewKind::Table), |el| {
                 let id = fields_id.clone();
                 let button = id.clone();
-                el.child(self.header_button(&button, "Columns", theme, cx, move |this, cx| {
+                el.child(self.header_button(&button, "columns", "Columns", theme, cx, move |this, cx| {
                     this.session.file.focus = Some(id.clone());
                     this.exec("view.fields", cx);
                 }))
             })
-            .child(self.header_button(id, "Link", theme, cx, move |this, cx| {
+            .child(self.header_button(id, "link", "Choose source link", theme, cx, move |this, cx| {
                 this.session.file.focus = Some(menu_id.clone());
                 this.exec("view.link", cx);
             }))
@@ -101,21 +101,25 @@ impl Root {
     fn header_button(
         &self,
         view: &str,
-        label: &'static str,
+        icon_name: &'static str,
+        tip: &'static str,
         theme: &Theme,
         cx: &mut Context<Self>,
         action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         div()
-            .id(SharedString::from(format!("hdr-{view}-{label}")))
-            .px_2()
-            .py(px(2.))
+            .id(SharedString::from(format!("hdr-{view}-{icon_name}")))
+            .w(px(26.))
+            .h(px(26.))
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded_sm()
-            .text_size(px(11.))
-            .text_color(rgb(theme.muted))
+            .text_color(rgb(theme.text))
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(theme.hover)).text_color(rgb(theme.text)))
-            .child(label)
+            .hover(|style| style.bg(rgb(theme.hover)))
+            .tooltip(crate::icons::tooltip(tip, *theme))
+            .child(crate::icons::icon(icon_name).w(px(14.)).h(px(14.)).text_color(rgb(theme.text)))
             .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| action(this, cx)))
     }
 
@@ -302,7 +306,10 @@ impl Root {
             .items_center()
             .cursor_pointer()
             .bg(rgb(if on { theme.accent_dim } else { theme.panel }))
-            .hover(|style| style.bg(rgb(if on { theme.accent_dim } else { theme.hover })))
+            .text_color(rgb(theme.text))
+            .border_l(px(3.))
+            .border_color(rgb(if on { theme.accent } else { theme.panel }))
+            .hover(|style| style.bg(rgb(if on { theme.accent_dim } else { theme.hover })).text_color(rgb(theme.text)))
             .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
                 this.session.select(&view_id, &record_id);
                 cx.notify();
@@ -519,7 +526,10 @@ impl Root {
                     .items_center()
                     .cursor_pointer()
                     .bg(rgb(if on { theme.accent_dim } else { theme.panel }))
-                    .hover(|style| style.bg(rgb(if on { theme.accent_dim } else { theme.hover })))
+                    .text_color(rgb(theme.text))
+                    .border_l(px(3.))
+                    .border_color(rgb(if on { theme.accent } else { theme.panel }))
+                    .hover(|style| style.bg(rgb(if on { theme.accent_dim } else { theme.hover })).text_color(rgb(theme.text)))
                     .child(label)
                     .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
                         this.session.select(&view_id, &record_id);
