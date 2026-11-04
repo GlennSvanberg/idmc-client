@@ -269,6 +269,7 @@ impl Root {
         let mark = match kind {
             Some(idmc_model::ViewKind::Tree) => "Tree",
             Some(idmc_model::ViewKind::Detail) => "Detail",
+            Some(idmc_model::ViewKind::Graph) => "Graph",
             _ => "Table",
         };
         let focus_id = id.to_string();

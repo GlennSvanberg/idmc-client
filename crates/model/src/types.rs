@@ -47,6 +47,7 @@ pub enum ViewKind {
     Tree,
     Table,
     Detail,
+    Graph,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,7 +370,7 @@ impl ModelDefinition {
                 ),
                 // A tree shows a whole hierarchy. Filtering it through an
                 // arbitrary relationship is not offered until a model describes that.
-                ViewKind::Tree => false,
+                ViewKind::Tree | ViewKind::Graph => false,
             };
             if ok {
                 out.push(LinkOption {

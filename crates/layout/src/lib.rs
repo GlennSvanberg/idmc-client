@@ -1,4 +1,7 @@
 //! Tiling layout tree: splits with ratios, tab groups as leaves.
+mod force;
+
+pub use force::{Body, NodeSpec, Simulation, Spring};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]

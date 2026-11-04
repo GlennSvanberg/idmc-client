@@ -18,6 +18,8 @@ pub static ACTIONS: &[Action] = &[
     Action { id: "workspace.rename", title: "Rename workspace", shortcut: None },
     Action { id: "workspace.close", title: "Close workspace", shortcut: None },
     Action { id: "record.search", title: "Search records", shortcut: None },
+    Action { id: "view.open_graph", title: "Open Graph view", shortcut: None },
+    Action { id: "record.show_in_graph", title: "Show in graph", shortcut: None },
     Action { id: "data.reload", title: "Reload records", shortcut: None },
     Action { id: "app.quit", title: "Quit", shortcut: Some("ctrl-q") },
     Action { id: "view.close", title: "Close focused view", shortcut: Some("ctrl-w") },

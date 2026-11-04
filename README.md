@@ -50,6 +50,8 @@ Drag a tab onto another pane. The overlay shows whether the view will become a t
 
 The Person workspace opens as a table of people, the selected person's detail, and tabs for the first child collections (addresses, phones, emails). Selecting a person updates the detail and those tables. Address rows are the nested PostalAddress groups on that person, not a separate master file. Country codes render with the sample labels (Sweden, Norway, …).
 
+**Show in graph** (the Graph button on a table or detail, or Ctrl+K) opens a dockable graph of the selected record: the person, a node per child collection, then the child rows. A reference field becomes a stub until that record is fetched. Double-click a node to expand it in place. With nothing selected, **Open Graph view** draws the schema instead. The view holds at most 400 nodes. Wheel zoom stays between 0.25 and 2.5, dragging the background pans, dragging a node pins it, `F` fits, and Escape clears the selection.
+
 The Item export has no mock records in this repo. It still loads as a model: entities, the description field group, the supplier reference, and the inverse. The hand-written sample under `mock/sample/` is a category tree with products and articles, which is what the tree view is for. Person has no hierarchy, so **New tree view** reports that.
 
 ## Layout of the repo

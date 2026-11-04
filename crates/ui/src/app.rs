@@ -96,10 +96,18 @@ impl Root {
                     .update(cx, |root, cx| {
                         let loaded = root.session.backend.poll();
                         let extra = root.session.absorb_async();
+                        let moving = root.session.graph.as_ref().is_some_and(|board| !board.settled());
+                        if moving {
+                            for _ in 0..12 {
+                                if !root.session.tick_graph() {
+                                    break;
+                                }
+                            }
+                        }
                         if loaded {
                             root.session.reconcile();
                         }
-                        if loaded || extra {
+                        if loaded || extra || moving {
                             cx.notify();
                         }
                     })
@@ -161,6 +169,8 @@ impl Root {
                 item("New table view", "", MenuCommand::Run("view.new_table")),
                 item("New detail view", "", MenuCommand::Run("view.new_detail")),
                 item("New tree view", "", MenuCommand::Run("view.new_tree")),
+                item("Open Graph view", "", MenuCommand::Run("view.open_graph")),
+                item("Show in graph", "", MenuCommand::Run("record.show_in_graph")),
             ],
         });
     }
@@ -172,6 +182,7 @@ impl Root {
         if table {
             items.push(item("Field chooser", "Ctrl+Alt+C", MenuCommand::Run("view.fields")));
         }
+        items.push(item("Show in graph", "", MenuCommand::Run("record.show_in_graph")));
         items.push(item("Choose source link", "Ctrl+Alt+L", MenuCommand::Run("view.link")));
         items.push(item("Clear source link", "", MenuCommand::Run("view.unlink")));
         items.push(item("Maximize / restore", "Ctrl+Alt+Z", MenuCommand::Run("view.zoom")));
@@ -186,7 +197,37 @@ impl Root {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.to_ascii_lowercase();
         let mods = &event.keystroke.modifiers;
-        let editing = self.session.palette.open || self.session.chooser_for.is_some() || self.session.filter_for.is_some();
+        let editing = self.session.palette.open || self.session.chooser_for.is_some() || self.session.filter_for.is_some() || self.session.graph_query;
+        if !editing && self.session.graph_focused() {
+            let plain = !mods.control && !mods.alt && !mods.platform && !mods.shift;
+            let effect = match key.as_str() {
+                "escape" => {
+                    self.session.graph.as_mut().map(|board| board.clear_selection());
+                    None
+                }
+                "enter" if plain => Some(self.session.graph_enter()),
+                "left" | "right" if plain => {
+                    self.session.graph.as_mut().map(|board| board.arrow(key.as_str()));
+                    None
+                }
+                "f" if plain => {
+                    if let Some(board) = self.session.graph.as_mut() {
+                        board.user_camera = false;
+                        let (w, h) = (board.width, board.height);
+                        board.fit(w, h);
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(effect) = effect {
+                self.apply_graph_effect(effect);
+            }
+            if matches!(key.as_str(), "escape" | "enter" | "left" | "right" | "f") && plain || key == "escape" {
+                cx.notify();
+            }
+            return;
+        }
         if !editing {
             if key == "escape" {
                 self.session.escape();
@@ -216,6 +257,15 @@ impl Root {
                     }
                 } else if let Some(view) = self.session.filter_for.clone() {
                     self.session.apply_filter(&view);
+                } else if self.session.graph_query {
+                    let query = self.session.graph_edit.text.clone();
+                    if self.session.backend.is_live() {
+                        self.session.backend.schedule_record_search(&query);
+                    } else {
+                        let hits = self.session.backend.search_records(&query, 8);
+                        self.session.seed_graph(&hits);
+                        self.session.graph_query = false;
+                    }
                 }
             }
             "backspace" => self.session.backspace(),
@@ -252,6 +302,7 @@ impl Root {
                 idmc_model::ViewKind::Table => "New table",
                 idmc_model::ViewKind::Detail => "New detail",
                 idmc_model::ViewKind::Tree => "New tree",
+                idmc_model::ViewKind::Graph => "Graph",
             },
             PaletteMode::PickLink(_) => "Source link",
             PaletteMode::OpenView => "Open view",

@@ -20,6 +20,7 @@ impl Root {
             ViewKind::Table => self.render_table(id, &spec.entity, &spec.columns, theme, cx),
             ViewKind::Detail => self.render_detail(id, &spec.entity, theme, cx),
             ViewKind::Tree => self.render_tree(id, &spec.entity, theme, cx),
+            ViewKind::Graph => self.render_graph(id, theme, cx),
         }
     }
 
@@ -76,6 +77,13 @@ impl Root {
                 )
             })
             .child(div().flex_1())
+            .when(matches!(kind, Some(ViewKind::Table | ViewKind::Detail)), |el| {
+                let id = menu_id.clone();
+                el.child(self.header_button(&format!("graph-{id}"), "Graph", theme, cx, move |this, cx| {
+                    this.session.file.focus = Some(id.clone());
+                    this.exec("record.show_in_graph", cx);
+                }))
+            })
             .when(kind == Some(ViewKind::Table), |el| {
                 let id = fields_id.clone();
                 let button = id.clone();

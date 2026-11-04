@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use idmc_model::{
-    FieldDef, FieldType, FieldValue, IdmcExportSource, JsonModelSource, ModelDefinition, ModelSource,
-    Record,
+    expand_key, FieldDef, FieldType, FieldValue, GraphEdge, IdmcExportSource, JsonModelSource,
+    ModelDefinition, ModelSource, NodeId, Record, Scene,
 };
 use serde_json::{Map, Value};
 
@@ -67,6 +67,8 @@ struct Hub {
     search_gen: u64,
     search_hits: Option<Vec<SearchHit>>,
     tenant: String,
+    expand_inflight: BTreeSet<String>,
+    expand_ready: Vec<Scene>,
 }
 
 #[derive(Clone)]
@@ -209,6 +211,8 @@ impl LiveBackend {
                 search_gen: 0,
                 search_hits: None,
                 tenant: String::new(),
+                expand_inflight: BTreeSet::new(),
+                expand_ready: Vec::new(),
             }),
         });
         let backend = Self { model, roots, shared };
@@ -431,6 +435,41 @@ impl LiveBackend {
         hub.search_hits.take()
     }
 
+    pub fn schedule_expand(&self, key: &str) {
+        {
+            let mut hub = lock(&self.shared.hub);
+            if !hub.expand_inflight.insert(key.to_string()) {
+                return;
+            }
+        }
+        let shared = Arc::clone(&self.shared);
+        let model = Arc::clone(&self.model);
+        let key = key.to_string();
+        std::thread::Builder::new()
+            .name("idmc-graph".into())
+            .spawn(move || {
+                let scene = expand_live(&shared, &model, &key);
+                {
+                    let mut hub = lock(&shared.hub);
+                    hub.expand_inflight.remove(&key);
+                    if !scene.nodes.is_empty() || !scene.edges.is_empty() {
+                        hub.expand_ready.push(scene);
+                    }
+                }
+                publish(&shared, true);
+            })
+            .ok();
+    }
+
+    pub fn take_expand(&self) -> Option<Scene> {
+        let mut hub = lock(&self.shared.hub);
+        if hub.expand_ready.is_empty() {
+            None
+        } else {
+            Some(hub.expand_ready.remove(0))
+        }
+    }
+
     pub fn search_records(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         let _ = (query, limit);
         Vec::new()
@@ -474,6 +513,76 @@ impl LiveBackend {
             view.revalidate = true;
         }
     }
+}
+
+fn expand_live(shared: &Shared, model: &ModelDefinition, key: &str) -> Scene {
+    if let Some(NodeId::Entity { be, id }) = NodeId::parse(key) {
+        let missing = {
+            let cache = lock(&shared.cache);
+            !cache.records.iter().any(|row| row.entity == be && row.id == id)
+        };
+        if missing {
+            let _ = fetch_entity(shared, model, &be, &id);
+        }
+    }
+    let records = lock(&shared.cache).records.clone();
+    let mut scene = expand_key(model, &records, key);
+    if let Some(NodeId::Type { be }) = NodeId::parse(key) {
+        let has_entity = scene.nodes.iter().any(|node| node.kind == idmc_model::NodeKind::Entity);
+        if !has_entity {
+            if let Ok(body) = shared.http.search_window(&be, "*", 0, 8, "", false) {
+                if let Ok(page) = parse_search_page(model, &be, &body) {
+                    for parsed in page.records {
+                        scene.merge(idmc_model::build_entity_scene(&parsed.record, model));
+                    }
+                }
+            }
+        }
+        if let Some(base) = shared.http.mdm_base() {
+            let url = format!("{base}/metadata/api/v2/objects/{}", encode_segment(&be));
+            if let Ok(body) = shared.http.get_json(&url) {
+                scene.edges.extend(metadata_edges(&be, &body));
+            }
+        }
+    }
+    scene
+}
+
+fn fetch_entity(shared: &Shared, model: &ModelDefinition, entity: &str, id: &str) -> Result<(), BackendError> {
+    let base = shared.http.mdm_base().ok_or_else(|| BackendError::Message("not logged in".into()))?;
+    let url = format!(
+        "{base}/business-entity/public/api/v1/entity/{}/{}",
+        encode_segment(entity),
+        encode_segment(id)
+    );
+    let body = shared.http.get_json(&url)?;
+    let parsed = parse_entity_record(model, entity, &body)?;
+    let mut cache = lock(&shared.cache);
+    remember(&mut cache, parsed);
+    Ok(())
+}
+
+fn metadata_edges(entity: &str, body: &Value) -> Vec<GraphEdge> {
+    let mut edges = Vec::new();
+    for name in ["relationships", "links", "businessEntityRelationships"] {
+        let Some(rows) = body.get(name).and_then(|value| value.as_array()) else { continue };
+        for row in rows {
+            let label = row.get("label").or_else(|| row.get("name")).and_then(|value| value.as_str()).unwrap_or("related");
+            let Some(target) = row.get("to").or_else(|| row.get("target")).or_else(|| row.get("businessEntity")).and_then(|value| value.as_str()) else { continue };
+            if target.is_empty() {
+                continue;
+            }
+            let source = NodeId::Type { be: entity.to_string() }.key();
+            let target_key = NodeId::Type { be: target.to_string() }.key();
+            edges.push(GraphEdge {
+                id: format!("{source}|{label}|{target_key}"),
+                source,
+                target: target_key,
+                label: label.to_string(),
+            });
+        }
+    }
+    edges
 }
 
 fn hydrate_one(shared: Arc<Shared>, model: Arc<ModelDefinition>, entity: String, id: String) {

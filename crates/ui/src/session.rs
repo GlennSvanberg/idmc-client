@@ -121,6 +121,11 @@ pub struct Session {
     master_sync: RefCell<HashMap<String, String>>,
     pub filter_for: Option<String>,
     pub filter_edit: TextEdit,
+    pub graph: Option<crate::graph::GraphBoard>,
+    pub graph_view: Option<String>,
+    pub graph_query: bool,
+    pub graph_edit: TextEdit,
+    pub graph_origin: RefCell<(f32, f32, f32, f32)>,
 }
 
 pub enum Launch {
@@ -158,6 +163,11 @@ impl Session {
             master_sync: RefCell::new(HashMap::new()),
             filter_for: None,
             filter_edit: TextEdit::new(),
+            graph: None,
+            graph_view: None,
+            graph_query: false,
+            graph_edit: TextEdit::new(),
+            graph_origin: RefCell::new((0.0, 0.0, 800.0, 600.0)),
         }
     }
 
@@ -167,6 +177,9 @@ impl Session {
 
     pub fn view_title(&self, id: &str) -> String {
         let Some(spec) = self.spec(id) else { return id.to_string() };
+        if spec.kind == ViewKind::Graph {
+            return "Graph".into();
+        }
         let Some(entity) = self.backend.model().entity(&spec.entity) else { return spec.entity.clone() };
         match spec.kind {
             ViewKind::Tree => entity
@@ -176,6 +189,7 @@ impl Session {
                 .unwrap_or_else(|| entity.label_plural.clone()),
             ViewKind::Table => entity.label_plural.clone(),
             ViewKind::Detail => entity.label.clone(),
+            ViewKind::Graph => "Graph".into(),
         }
     }
 
@@ -228,6 +242,9 @@ impl Session {
 
     fn fresh_rows(&self, view_id: &str) -> Arc<Vec<Record>> {
         let Some(spec) = self.spec(view_id) else { return Arc::new(Vec::new()) };
+        if spec.kind == ViewKind::Graph {
+            return Arc::new(Vec::new());
+        }
         if spec.link.is_none() && spec.kind != ViewKind::Tree {
             return self.backend.shared_records(&spec.entity);
         }
@@ -268,6 +285,7 @@ impl Session {
                 ViewKind::Tree => 0u8,
                 ViewKind::Table => 1,
                 ViewKind::Detail => 2,
+                ViewKind::Graph => 3,
             }
             .hash(&mut hasher);
             if let Some(link) = &view.link {
@@ -428,6 +446,8 @@ impl Session {
             "workspace.duplicate" => self.duplicate_workspace(),
             "workspace.rename" => self.begin_rename(),
             "workspace.close" => self.close_workspace(),
+            "view.open_graph" => self.open_graph(None),
+            "record.show_in_graph" => self.show_in_graph(),
             "record.search" => {
                 self.palette.open_commands();
                 self.menu = None;
@@ -465,6 +485,10 @@ impl Session {
     }
 
     fn nudge_selection(&mut self, delta: i32) {
+        if self.graph_focused() && !self.palette.open {
+            self.graph.as_mut().map(|board| board.arrow(if delta > 0 { "down" } else { "up" }));
+            return;
+        }
         if self.palette.open {
             let len = self.palette_len();
             if len == 0 {
@@ -506,6 +530,7 @@ impl Session {
                     ViewKind::Table => "Table",
                     ViewKind::Detail => "Detail",
                     ViewKind::Tree => "Tree",
+                    ViewKind::Graph => "Graph",
                 };
                 let name = if kind == ViewKind::Table {
                     entity.label_plural.as_str()
@@ -732,7 +757,14 @@ impl Session {
     pub fn absorb_async(&mut self) -> bool {
         let mut changed = false;
         if let Some(hits) = self.backend.take_record_search() {
+            if self.graph_query {
+                self.seed_graph(&hits);
+                self.graph_query = false;
+            }
             self.search_hits = hits;
+            changed = true;
+        }
+        if self.absorb_graph() {
             changed = true;
         }
         for line in self.backend.timing_lines() {
@@ -994,6 +1026,7 @@ impl Session {
                 ViewKind::Table => "table",
                 ViewKind::Detail => "detail",
                 ViewKind::Tree => "tree",
+                ViewKind::Graph => "graph",
             },
             entity,
             self.file.views.len() + 1
@@ -1074,6 +1107,10 @@ impl Session {
         self.file.focus = next.clone();
         if let Some(focus) = next {
             self.file.layout.activate(&focus);
+        }
+        if self.graph_view.as_deref() == Some(id) {
+            self.graph_view = None;
+            self.graph = None;
         }
         self.reconcile();
         self.status = "View closed".into();
@@ -1252,6 +1289,8 @@ impl Session {
             edit(&mut self.palette.edit);
             self.palette.cursor = 0;
             self.refresh_search();
+        } else if self.graph_query {
+            edit(&mut self.graph_edit);
         } else if self.chooser_for.is_some() {
             edit(&mut self.chooser_filter);
         } else if self.filter_for.is_some() {
@@ -1294,6 +1333,10 @@ impl Session {
     pub fn escape(&mut self) {
         if self.palette.open {
             self.palette.open = false;
+        } else if self.graph_query {
+            self.graph_query = false;
+        } else if self.graph_focused() {
+            self.graph.as_mut().map(|board| board.clear_selection());
         } else if self.chooser_for.is_some() {
             self.chooser_for = None;
             self.chooser_filter.clear();

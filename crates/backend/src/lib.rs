@@ -3,7 +3,7 @@
 //! replace it later without changing views.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -60,6 +60,9 @@ pub trait Backend {
     fn schedule_record_search(&self, _query: &str) {}
     fn take_record_search(&self) -> Option<Vec<SearchHit>> { None }
     fn timing_lines(&self) -> Vec<String> { Vec::new() }
+    /// Fetch the neighborhood of a graph node. In-flight calls for the same key are dropped.
+    fn schedule_expand(&self, _key: &str) {}
+    fn take_expand(&self) -> Option<idmc_model::Scene> { None }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +105,8 @@ pub struct MockBackend {
     generation: u64,
     lists: RefCell<ListCache>,
     view_state: RefCell<HashMap<String, MasterView>>,
+    expand_inflight: RefCell<HashSet<String>>,
+    expand_ready: RefCell<Vec<(String, idmc_model::Scene)>>,
 }
 
 impl MockBackend {
@@ -123,6 +128,8 @@ impl MockBackend {
             generation,
             lists: RefCell::new(ListCache::default()),
             view_state: RefCell::new(HashMap::new()),
+            expand_inflight: RefCell::new(HashSet::new()),
+            expand_ready: RefCell::new(Vec::new()),
         }
     }
 
@@ -305,6 +312,27 @@ impl Backend for MockBackend {
     }
     fn search_records(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         search_local(&self.model, &self.records, query, limit)
+    }
+    fn schedule_expand(&self, key: &str) {
+        if !self.expand_inflight.borrow_mut().insert(key.to_string()) {
+            return;
+        }
+        let scene = idmc_model::expand_key(&self.model, &self.records, key);
+        if scene.nodes.is_empty() && scene.edges.is_empty() {
+            self.expand_inflight.borrow_mut().remove(key);
+            return;
+        }
+        self.expand_ready.borrow_mut().push((key.to_string(), scene));
+    }
+    fn take_expand(&self) -> Option<idmc_model::Scene> {
+        let mut ready = self.expand_ready.borrow_mut();
+        if ready.is_empty() {
+            None
+        } else {
+            let (key, scene) = ready.remove(0);
+            self.expand_inflight.borrow_mut().remove(&key);
+            Some(scene)
+        }
     }
 }
 
@@ -711,6 +739,18 @@ impl Backend for AppBackend {
         match self {
             AppBackend::Mock(_) => Vec::new(),
             AppBackend::Live(backend) => backend.timing_lines(),
+        }
+    }
+    fn schedule_expand(&self, key: &str) {
+        match self {
+            AppBackend::Mock(backend) => backend.schedule_expand(key),
+            AppBackend::Live(backend) => backend.schedule_expand(key),
+        }
+    }
+    fn take_expand(&self) -> Option<idmc_model::Scene> {
+        match self {
+            AppBackend::Mock(backend) => backend.take_expand(),
+            AppBackend::Live(backend) => backend.take_expand(),
         }
     }
 }

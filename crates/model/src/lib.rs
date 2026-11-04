@@ -4,9 +4,15 @@
 //! hardcode entity or field names. Two loaders implement [`ModelSource`]:
 //! a hand-written JSON file, and an Informatica Business 360 export package.
 
+mod graph;
 mod idmc;
 mod types;
 mod value;
+
+pub use graph::{
+    build_entity_scene, build_model_scene, build_record_fields, expand_key, node_mark, radius_for, stub_entity,
+    GraphEdge, GraphNode, GraphProperty, NodeId, NodeKind, Scene, SCENE_CAP,
+};
 
 pub use idmc::IdmcExportSource;
 pub use types::*;

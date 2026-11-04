@@ -4,6 +4,7 @@ pub mod actions;
 pub mod app;
 pub mod dock;
 pub mod edit;
+pub mod graph;
 pub mod session;
 pub mod theme;
 pub mod views;
