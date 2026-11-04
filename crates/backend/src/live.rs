@@ -4,13 +4,13 @@
 //! The model still comes from an export package. Credentials stay in memory and
 //! are never written to the debug dump.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Write, stdout};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use idmc_model::{
     FieldDef, FieldType, FieldValue, IdmcExportSource, JsonModelSource, ModelDefinition, ModelSource,
@@ -20,12 +20,15 @@ use serde_json::{Map, Value};
 
 use crate::config::env_path;
 use crate::{
-    hierarchy_children_of, hierarchy_roots_of, label_of, record_of, records_of,
-    related_of, Backend, BackendError,
+    hierarchy_children_of, hierarchy_roots_of, label_text, records_of, related_of, Backend,
+    BackendError, SearchHit,
 };
 
-const PAGE: u64 = 25;
-const MAX_RECORDS: usize = 5000;
+const PAGE: u64 = 500;
+const MAX_FLIGHT: usize = 4;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const PUBLISH_EVERY: Duration = Duration::from_millis(400);
 
 pub struct LiveConfig {
     pub login_url: String,
@@ -46,31 +49,72 @@ pub struct LiveBackend {
 struct Shared {
     http: IdmcHttp,
     cache: Mutex<Cache>,
+    lists: Mutex<Lists>,
     epoch: AtomicU64,
     generation: AtomicU64,
     seen: AtomicU64,
+    last_publish_ms: AtomicU64,
     last_error: Mutex<Option<String>>,
+    hub: Mutex<Hub>,
+}
+
+struct Hub {
+    views: HashMap<String, EntityWindow>,
+    started: Instant,
+    logged_first: bool,
+    logged_3000: bool,
+    timing: Vec<String>,
+    search_gen: u64,
+    search_hits: Option<Vec<SearchHit>>,
+    tenant: String,
+}
+
+#[derive(Clone)]
+struct EntityWindow {
+    query: String,
+    sort_field: String,
+    descending: bool,
+    hits: Option<usize>,
+    pages: BTreeMap<u64, Vec<Record>>,
+    inflight: BTreeSet<u64>,
+    revalidate: bool,
+}
+
+impl EntityWindow {
+    fn new(sort_field: String) -> Self {
+        Self {
+            query: String::new(),
+            sort_field,
+            descending: false,
+            hits: None,
+            pages: BTreeMap::new(),
+            inflight: BTreeSet::new(),
+            revalidate: false,
+        }
+    }
+}
+
+struct Lists {
+    generation: u64,
+    values: HashMap<String, Arc<Vec<Record>>>,
 }
 
 struct Cache {
     records: Vec<Record>,
+    index: HashMap<String, usize>,
     lookups: BTreeMap<(String, String), String>,
     hydrated: BTreeSet<String>,
-    progress: BTreeMap<String, Progress>,
-}
-
-struct Progress {
-    loaded: usize,
-    hits: usize,
+    inflight: BTreeSet<String>,
 }
 
 impl Default for Cache {
     fn default() -> Self {
         Self {
             records: Vec::new(),
+            index: HashMap::new(),
             lookups: BTreeMap::new(),
             hydrated: BTreeSet::new(),
-            progress: BTreeMap::new(),
+            inflight: BTreeSet::new(),
         }
     }
 }
@@ -83,6 +127,7 @@ struct IdmcHttp {
     dump: Mutex<Option<File>>,
     session: Mutex<Option<SessionInfo>>,
     login_gate: Mutex<()>,
+    trace: bool,
 }
 
 struct SessionInfo {
@@ -104,17 +149,27 @@ struct ParsedRecord {
 }
 
 pub fn check_login(config: &LiveConfig) -> Result<String, BackendError> {
+    step("check-login: loading model");
     let model = load_model(config)?;
     let entity = model
         .roots()
         .next()
         .map(|entity| entity.id.clone())
         .unwrap_or_else(|| "c360.person".into());
-    let http = IdmcHttp::connect(config)?;
+    step(&format!("check-login: model {}, entity {entity}", model.name));
+    let http = IdmcHttp::connect(config, true)?;
     http.login()?;
+    let started = Instant::now();
     let body = http.search(&entity, 0, 1)?;
     let page = parse_search_page(&model, &entity, &body)?;
     let first = page.records.first().map(|row| row.record.id.clone());
+    step(&format!(
+        "search parsed in {}ms: {} hits, {} records{}",
+        started.elapsed().as_millis(),
+        page.hits,
+        page.records.len(),
+        first.as_ref().map(|id| format!(", first record {id}")).unwrap_or_default()
+    ));
     let id = first
         .as_ref()
         .map(|id| format!(", first record {id}"))
@@ -122,6 +177,11 @@ pub fn check_login(config: &LiveConfig) -> Result<String, BackendError> {
     let api = http.session.lock().ok().and_then(|g| g.as_ref().map(|s| s.api.clone())).unwrap_or_else(|| "?".into());
     let mdm = http.session.lock().ok().and_then(|g| g.as_ref().map(|s| s.mdm_base.clone())).unwrap_or_default();
     Ok(format!("login ok ({api})\nmdm {mdm}\nsearch {entity}: {} hits{id}", page.hits))
+}
+
+fn step(line: &str) {
+    println!("{line}");
+    let _ = stdout().flush();
 }
 
 impl LiveBackend {
@@ -132,12 +192,24 @@ impl LiveBackend {
             return Err(BackendError::Message("the model has no master entities to search".into()));
         }
         let shared = Arc::new(Shared {
-            http: IdmcHttp::connect(&config)?,
+            http: IdmcHttp::connect(&config, false)?,
             cache: Mutex::new(Cache::default()),
+            lists: Mutex::new(Lists { generation: u64::MAX, values: HashMap::new() }),
             epoch: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             seen: AtomicU64::new(0),
+            last_publish_ms: AtomicU64::new(0),
             last_error: Mutex::new(None),
+            hub: Mutex::new(Hub {
+                views: HashMap::new(),
+                started: Instant::now(),
+                logged_first: false,
+                logged_3000: false,
+                timing: Vec::new(),
+                search_gen: 0,
+                search_hits: None,
+                tenant: String::new(),
+            }),
         });
         let backend = Self { model, roots, shared };
         backend.begin_load()?;
@@ -154,97 +226,303 @@ impl LiveBackend {
             let mut cache = lock(&self.shared.cache);
             *cache = Cache::default();
         }
+        {
+            let mut lists = lock(&self.shared.lists);
+            lists.values.clear();
+            lists.generation = u64::MAX;
+        }
         if let Ok(mut err) = self.shared.last_error.lock() {
             *err = None;
         }
         self.shared.http.login()?;
-        for entity in &self.roots {
+        if let Some(base) = self.shared.http.mdm_base() {
+            lock(&self.shared.hub).tenant = base;
+        }
+        self.restore_disk();
+        for entity in self.roots.clone() {
             if self.shared.epoch.load(Ordering::Relaxed) != epoch {
                 return Ok(());
             }
-            let body = self.shared.http.search(entity, 0, PAGE)?;
-            let page = parse_search_page(&self.model, entity, &body)?;
-            self.ingest(entity, page);
+            self.master_touch(&entity, 0, 1);
         }
-        self.spawn(epoch);
+        let _ = epoch;
         Ok(())
     }
 
-    fn spawn(&self, epoch: u64) {
-        let shared = Arc::clone(&self.shared);
-        let model = Arc::clone(&self.model);
-        let roots = self.roots.clone();
-        std::thread::Builder::new()
-            .name("idmc-search".into())
-            .spawn(move || load_rest(shared, model, roots, epoch))
-            .ok();
-    }
-
-    fn ingest(&self, entity: &str, page: SearchPage) {
-        let mut cache = lock(&self.shared.cache);
-        for parsed in page.records {
-            remember(&mut cache, parsed);
-        }
-        let loaded = cache.records.iter().filter(|row| row.entity == entity).count();
-        cache.progress.insert(
-            entity.to_string(),
-            Progress { loaded, hits: page.hits.max(loaded) },
-        );
-        self.shared.generation.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn ensure(&self, entity: &str, id: &str) {
+    /// GET one master off the UI thread and keep the body on that record.
+    fn schedule_hydrate(&self, entity: &str, id: &str) {
         if self.model.embedded_children(entity).next().is_none() {
             return;
         }
         let key = format!("{entity}\0{id}");
-        let present = {
-            let cache = lock(&self.shared.cache);
-            if cache.hydrated.contains(&key) {
+        {
+            let mut cache = lock(&self.shared.cache);
+            if cache.hydrated.contains(&key) || cache.inflight.contains(&key) {
                 return;
             }
-            cache.records.iter().any(|row| row.entity == entity && row.id == id)
+            if !cache.index.contains_key(&key) {
+                return;
+            }
+            cache.inflight.insert(key.clone());
+        }
+        let shared = Arc::clone(&self.shared);
+        let model = Arc::clone(&self.model);
+        let entity = entity.to_string();
+        let id = id.to_string();
+        std::thread::Builder::new()
+            .name("idmc-record".into())
+            .spawn(move || hydrate_one(shared, model, entity, id))
+            .ok();
+    }
+
+    fn snapshot(&self) -> Vec<Record> {
+        lock(&self.shared.cache).records.clone()
+    }
+
+    fn list_hit(&self, key: &str) -> Option<Arc<Vec<Record>>> {
+        let generation = self.shared.generation.load(Ordering::Acquire);
+        let lists = lock(&self.shared.lists);
+        if lists.generation != generation {
+            return None;
+        }
+        lists.values.get(key).cloned()
+    }
+
+    fn store_list(&self, key: &str, rows: Arc<Vec<Record>>) {
+        let generation = self.shared.generation.load(Ordering::Acquire);
+        let mut lists = lock(&self.shared.lists);
+        if lists.generation != generation {
+            lists.values.clear();
+            lists.generation = generation;
+        }
+        lists.values.insert(key.to_string(), rows);
+    }
+
+    fn sort_field_for(&self, entity: &str) -> String {
+        let field = self
+            .model
+            .entity(entity)
+            .and_then(|entry| entry.label_fields.first().cloned())
+            .or_else(|| {
+                self.model
+                    .entity(entity)
+                    .and_then(|entry| entry.default_columns().into_iter().next())
+            })
+            .unwrap_or_default();
+        if field.is_empty() {
+            return String::new();
+        }
+        search_field_name(entity, &field)
+    }
+
+    pub fn master_total(&self, entity: &str) -> usize {
+        let hub = lock(&self.shared.hub);
+        hub.views.get(entity).and_then(|view| view.hits).unwrap_or(0)
+    }
+
+    pub fn master_known(&self, entity: &str) -> bool {
+        let hub = lock(&self.shared.hub);
+        hub.views.get(entity).and_then(|view| view.hits).is_some()
+    }
+
+    pub fn master_at(&self, entity: &str, index: usize) -> Option<Record> {
+        let hub = lock(&self.shared.hub);
+        let view = hub.views.get(entity)?;
+        let offset = (index as u64 / PAGE) * PAGE;
+        view.pages.get(&offset)?.get(index - offset as usize).cloned()
+    }
+
+    pub fn master_touch(&self, entity: &str, start: usize, end: usize) {
+        let sort_field = self.sort_field_for(entity);
+        let epoch = self.shared.epoch.load(Ordering::Relaxed);
+        let mut offsets = Vec::new();
+        {
+            let mut hub = lock(&self.shared.hub);
+            let flight = hub.views.values().map(|row| row.inflight.len()).sum::<usize>();
+            let view = hub.views.entry(entity.to_string()).or_insert_with(|| EntityWindow::new(sort_field));
+            let hits = view.hits.unwrap_or(usize::MAX);
+            if hits == 0 {
+                return;
+            }
+            let mut flight = flight;
+            let from = start.saturating_sub(PAGE as usize);
+            let to = end.saturating_add(PAGE as usize).min(hits);
+            let mut offset = (from as u64 / PAGE) * PAGE;
+            let last = to as u64;
+            while offset < last && flight < MAX_FLIGHT {
+                let cached = view.pages.contains_key(&offset);
+                let refresh = offset == 0 && view.revalidate;
+                if (!cached || refresh) && !view.inflight.contains(&offset) {
+                    view.inflight.insert(offset);
+                    offsets.push(offset);
+                    flight += 1;
+                }
+                offset += PAGE;
+            }
+            if start == 0 && offsets.is_empty() && !view.pages.contains_key(&0) && !view.inflight.contains(&0) && flight < MAX_FLIGHT {
+                view.inflight.insert(0);
+                offsets.push(0);
+            }
+        }
+        for offset in offsets {
+            self.spawn_page(entity, offset, epoch);
+        }
+    }
+
+    pub fn set_master_view(&self, entity: &str, query: &str, sort_field: Option<&str>, descending: bool) {
+        let sort_field = sort_field
+            .filter(|field| !field.is_empty())
+            .map(|field| search_field_name(entity, field))
+            .unwrap_or_else(|| self.sort_field_for(entity));
+        let query = query.trim().to_string();
+        let mut reset = false;
+        {
+            let mut hub = lock(&self.shared.hub);
+            let view = hub.views.entry(entity.to_string()).or_insert_with(|| EntityWindow::new(sort_field.clone()));
+            if view.query != query || view.sort_field != sort_field || view.descending != descending {
+                view.query = query;
+                view.sort_field = sort_field;
+                view.descending = descending;
+                view.pages.clear();
+                view.inflight.clear();
+                view.hits = None;
+                view.revalidate = false;
+                reset = true;
+            }
+        }
+        if reset {
+            self.restore_one(entity);
+            self.master_touch(entity, 0, 1);
+        }
+    }
+
+    pub fn timing_lines(&self) -> Vec<String> {
+        let mut hub = lock(&self.shared.hub);
+        std::mem::take(&mut hub.timing)
+    }
+
+    pub fn schedule_record_search(&self, query: &str) {
+        let query = query.trim().to_string();
+        let gen = {
+            let mut hub = lock(&self.shared.hub);
+            hub.search_gen = hub.search_gen.wrapping_add(1);
+            if query.len() < 2 {
+                hub.search_hits = Some(Vec::new());
+                hub.search_gen
+            } else {
+                hub.search_gen
+            }
         };
-        if !present {
+        if query.len() < 2 {
+            publish(&self.shared, true);
             return;
         }
-        let base = match self.shared.http.mdm_base() {
-            Some(base) => base,
-            None => return,
+        let shared = Arc::clone(&self.shared);
+        let model = Arc::clone(&self.model);
+        let roots = self.roots.clone();
+        std::thread::Builder::new()
+            .name("idmc-find".into())
+            .spawn(move || record_search(shared, model, roots, query, gen))
+            .ok();
+    }
+
+    pub fn take_record_search(&self) -> Option<Vec<SearchHit>> {
+        let mut hub = lock(&self.shared.hub);
+        hub.search_hits.take()
+    }
+
+    pub fn search_records(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        let _ = (query, limit);
+        Vec::new()
+    }
+
+    fn spawn_page(&self, entity: &str, offset: u64, epoch: u64) {
+        let shared = Arc::clone(&self.shared);
+        let model = Arc::clone(&self.model);
+        let entity = entity.to_string();
+        let (query, sort_field, descending) = {
+            let hub = lock(&self.shared.hub);
+            match hub.views.get(&entity) {
+                Some(view) => (view.query.clone(), view.sort_field.clone(), view.descending),
+                None => return,
+            }
         };
+        std::thread::Builder::new()
+            .name("idmc-page".into())
+            .spawn(move || fetch_page(shared, model, entity, offset, epoch, query, sort_field, descending))
+            .ok();
+    }
+
+    fn restore_disk(&self) {
+        for entity in self.roots.clone() {
+            self.restore_one(&entity);
+        }
+    }
+
+    fn restore_one(&self, entity: &str) {
+        let tenant = lock(&self.shared.hub).tenant.clone();
+        if tenant.is_empty() {
+            return;
+        }
+        let sort = self.sort_field_for(entity);
+        let Some(cached) = read_disk(&tenant, entity, &sort, false, "") else { return };
+        let mut hub = lock(&self.shared.hub);
+        let view = hub.views.entry(entity.to_string()).or_insert_with(|| EntityWindow::new(sort));
+        if view.query.is_empty() && !view.descending {
+            view.hits = Some(cached.hits);
+            view.pages = cached.pages;
+            view.revalidate = true;
+        }
+    }
+}
+
+fn hydrate_one(shared: Arc<Shared>, model: Arc<ModelDefinition>, entity: String, id: String) {
+    let key = format!("{entity}\0{id}");
+    let outcome = (|| -> Result<ParsedRecord, BackendError> {
+        let base = shared.http.mdm_base().ok_or_else(|| BackendError::Message("not logged in".into()))?;
         let url = format!(
             "{base}/business-entity/public/api/v1/entity/{}/{}",
-            encode_segment(entity),
-            encode_segment(id)
+            encode_segment(&entity),
+            encode_segment(&id)
         );
-        let body = match self.shared.http.get_json(&url) {
-            Ok(body) => body,
-            Err(err) => {
-                if let Ok(mut slot) = self.shared.last_error.lock() {
-                    *slot = Some(public_error(&err.to_string()));
-                }
-                return;
-            }
-        };
-        let parsed = match parse_entity_record(&self.model, entity, &body) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                if let Ok(mut slot) = self.shared.last_error.lock() {
-                    *slot = Some(public_error(&err.to_string()));
-                }
-                return;
-            }
-        };
-        let mut cache = lock(&self.shared.cache);
-        if let Some(slot) = cache.records.iter_mut().find(|row| row.entity == entity && row.id == id) {
-            *slot = parsed.record;
+        let body = shared.http.get_json(&url)?;
+        parse_entity_record(&model, &entity, &body)
+    })();
+    let mut cache = lock(&shared.cache);
+    cache.inflight.remove(&key);
+    match outcome {
+        Ok(parsed) => {
+            remember(&mut cache, parsed);
+            cache.hydrated.insert(key);
+            drop(cache);
+            publish(&shared, true);
         }
-        for (lookup, code, name) in parsed.lookups {
-            cache.lookups.insert((lookup, code), name);
+        Err(err) => {
+            cache.hydrated.insert(key);
+            drop(cache);
+            if let Ok(mut slot) = shared.last_error.lock() {
+                *slot = Some(public_error(&err.to_string()));
+            }
+            publish(&shared, true);
         }
-        cache.hydrated.insert(key);
-        self.shared.generation.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn publish(shared: &Shared, force: bool) {
+    let now = now_ms();
+    let last = shared.last_publish_ms.load(Ordering::Relaxed);
+    if !force && now.saturating_sub(last) < PUBLISH_EVERY.as_millis() as u64 {
+        return;
+    }
+    shared.last_publish_ms.store(now, Ordering::Relaxed);
+    shared.generation.fetch_add(1, Ordering::Release);
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Drop for LiveBackend {
@@ -257,41 +535,87 @@ impl Backend for LiveBackend {
     fn model(&self) -> &ModelDefinition { &self.model }
 
     fn records(&self, entity: &str) -> Vec<Record> {
-        let cache = lock(&self.shared.cache);
-        records_of(&self.model, &cache.records, entity)
+        self.shared_records(entity).as_ref().clone()
+    }
+
+    fn shared_records(&self, entity: &str) -> Arc<Vec<Record>> {
+        let key = format!("records\0{entity}");
+        if let Some(hit) = self.list_hit(&key) {
+            return hit;
+        }
+        let generation = self.shared.generation.load(Ordering::Acquire);
+        let snapshot = self.snapshot();
+        let rows = Arc::new(records_of(&self.model, &snapshot, entity));
+        if self.shared.generation.load(Ordering::Acquire) == generation {
+            self.store_list(&key, Arc::clone(&rows));
+        }
+        rows
     }
 
     fn record(&self, entity: &str, id: &str) -> Option<Record> {
+        if self.model.entity(entity).and_then(|entry| entry.embedded_in.as_ref()).is_some() {
+            return self.shared_records(entity).iter().find(|row| row.id == id).cloned();
+        }
         let cache = lock(&self.shared.cache);
-        record_of(&self.model, &cache.records, entity, id)
+        let pos = *cache.index.get(&index_key(entity, id))?;
+        Some(cache.records[pos].clone())
     }
 
     fn label(&self, entity: &str, id: &str) -> String {
-        let cache = lock(&self.shared.cache);
-        label_of(&self.model, &cache.records, entity, id)
+        self.record(entity, id)
+            .map(|record| label_text(&self.model, &record))
+            .unwrap_or_else(|| id.to_string())
     }
 
     fn related(&self, relationship: &str, source_id: &str) -> Result<Vec<Record>, BackendError> {
-        if let Some(rel) = self.model.relationship(relationship) {
-            if rel.embedded {
-                self.ensure(&rel.from, source_id);
-            }
+        let key = format!("rel\0{relationship}\0{source_id}");
+        if let Some(hit) = self.list_hit(&key) {
+            return Ok(hit.as_ref().clone());
         }
-        let cache = lock(&self.shared.cache);
-        related_of(&self.model, &cache.records, relationship, source_id)
+        let rows = if let Some(rel) = self.model.relationship(relationship) {
+            if rel.embedded {
+                self.schedule_hydrate(&rel.from, source_id);
+                let parent = self.record(&rel.from, source_id).ok_or_else(|| {
+                    BackendError::Message(format!("no {} record {source_id}", rel.from))
+                })?;
+                related_of(&self.model, std::slice::from_ref(&parent), relationship, source_id)?
+            } else {
+                let snapshot = self.snapshot();
+                related_of(&self.model, &snapshot, relationship, source_id)?
+            }
+        } else {
+            return Err(BackendError::Message(format!("unknown relationship {relationship}")));
+        };
+        let shared = Arc::new(rows);
+        self.store_list(&key, Arc::clone(&shared));
+        Ok(shared.as_ref().clone())
     }
 
     fn hierarchy_roots(&self, entity: &str) -> Vec<Record> {
-        let cache = lock(&self.shared.cache);
-        hierarchy_roots_of(&self.model, &cache.records, entity)
+        let key = format!("roots\0{entity}");
+        if let Some(hit) = self.list_hit(&key) {
+            return hit.as_ref().clone();
+        }
+        let snapshot = self.snapshot();
+        let rows = hierarchy_roots_of(&self.model, &snapshot, entity);
+        self.store_list(&key, Arc::new(rows.clone()));
+        rows
     }
 
     fn hierarchy_children(&self, entity: &str, id: &str) -> Vec<Record> {
-        let cache = lock(&self.shared.cache);
-        hierarchy_children_of(&self.model, &cache.records, entity, id)
+        let key = format!("kids\0{entity}\0{id}");
+        if let Some(hit) = self.list_hit(&key) {
+            return hit.as_ref().clone();
+        }
+        let snapshot = self.snapshot();
+        let rows = hierarchy_children_of(&self.model, &snapshot, entity, id);
+        self.store_list(&key, Arc::new(rows.clone()));
+        rows
     }
 
-    fn prepare(&self, entity: &str, id: &str) { self.ensure(entity, id); }
+    fn prepare(&self, entity: &str, id: &str) { self.schedule_hydrate(entity, id); }
+
+    fn generation(&self) -> u64 { self.shared.generation.load(Ordering::Acquire) }
 
     fn poll(&self) -> bool {
         let generation = self.shared.generation.load(Ordering::Relaxed);
@@ -309,13 +633,17 @@ impl Backend for LiveBackend {
         if let Some(err) = err {
             return format!("Live · {err}");
         }
-        let cache = lock(&self.shared.cache);
-        let loaded: usize = cache.progress.values().map(|row| row.loaded).sum();
-        let hits: usize = cache.progress.values().map(|row| row.hits).sum();
-        if hits > loaded {
-            format!("Live · {loaded} of {hits}")
+        let hub = lock(&self.shared.hub);
+        let hits: usize = hub.views.values().filter_map(|view| view.hits).sum();
+        let known = hub.views.values().any(|view| view.hits.is_some());
+        let refreshing = hub.views.values().any(|view| view.revalidate);
+        if !known {
+            return "Live · loading".into();
+        }
+        if refreshing {
+            format!("Live · {hits} cached")
         } else {
-            format!("Live · {loaded} records")
+            format!("Live · {hits}")
         }
     }
 
@@ -326,77 +654,239 @@ impl Backend for LiveBackend {
     }
 }
 
-fn load_rest(shared: Arc<Shared>, model: Arc<ModelDefinition>, roots: Vec<String>, epoch: u64) {
-    for entity in roots {
-        loop {
-            if shared.epoch.load(Ordering::Relaxed) != epoch {
-                return;
-            }
-            let (loaded, hits) = {
-                let cache = lock(&shared.cache);
-                match cache.progress.get(&entity) {
-                    Some(progress) => (progress.loaded, progress.hits),
-                    None => (0, 0),
-                }
-            };
-            if loaded >= hits || loaded >= MAX_RECORDS {
-                break;
-            }
-            let body = match shared.http.search(&entity, loaded as u64, PAGE) {
-                Ok(body) => body,
-                Err(err) => {
-                    if let Ok(mut slot) = shared.last_error.lock() {
-                        *slot = Some(public_error(&err.to_string()));
-                    }
-                    shared.generation.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
+fn fetch_page(
+    shared: Arc<Shared>,
+    model: Arc<ModelDefinition>,
+    entity: String,
+    offset: u64,
+    epoch: u64,
+    query: String,
+    sort_field: String,
+    descending: bool,
+) {
+    if shared.epoch.load(Ordering::Relaxed) != epoch {
+        let mut hub = lock(&shared.hub);
+        if let Some(view) = hub.views.get_mut(&entity) {
+            view.inflight.remove(&offset);
+        }
+        return;
+    }
+    let result = shared.http.search_window(&entity, &query, offset, PAGE, &sort_field, descending);
+    match result {
+        Ok(body) => {
             let page = match parse_search_page(&model, &entity, &body) {
                 Ok(page) => page,
                 Err(err) => {
-                    if let Ok(mut slot) = shared.last_error.lock() {
-                        *slot = Some(public_error(&err.to_string()));
-                    }
+                    fail_page(&shared, &entity, offset, &err.to_string());
                     return;
                 }
             };
-            if page.records.is_empty() {
-                break;
+            let hits = page.hits;
+            let mut rows = Vec::new();
+            {
+                let mut cache = lock(&shared.cache);
+                for parsed in page.records {
+                    rows.push(parsed.record.clone());
+                    remember(&mut cache, parsed);
+                }
             }
-            let mut cache = lock(&shared.cache);
-            let before = cache.records.len();
-            for parsed in page.records {
-                remember(&mut cache, parsed);
+            let shown = rows.len();
+            let covers_3000 = {
+                let mut hub = lock(&shared.hub);
+                let Some(view) = hub.views.get_mut(&entity) else { return };
+                view.inflight.remove(&offset);
+                view.revalidate = false;
+                view.hits = Some(hits);
+                view.pages.insert(offset, rows);
+                hits > 3000
+                    && view.pages.iter().any(|(page_offset, page_rows)| {
+                        let start = *page_offset as usize;
+                        start <= 3000 && 3000 < start + page_rows.len()
+                    })
+            };
+            {
+                let mut hub = lock(&shared.hub);
+                let elapsed = hub.started.elapsed().as_millis();
+                if offset == 0 && !hub.logged_first {
+                    hub.logged_first = true;
+                    let line = format!("timing: first rows {elapsed}ms ({shown} of {hits})");
+                    step(&line);
+                    hub.timing.push(line);
+                }
+                if covers_3000 && !hub.logged_3000 {
+                    hub.logged_3000 = true;
+                    let line = format!("timing: row 3000 ready {elapsed}ms");
+                    step(&line);
+                    hub.timing.push(line);
+                }
             }
-            if cache.records.len() == before {
-                break;
+            let tenant = lock(&shared.hub).tenant.clone();
+            if !tenant.is_empty() {
+                let pages = lock(&shared.hub).views.get(&entity).map(|view| view.pages.clone()).unwrap_or_default();
+                write_disk(&tenant, &entity, &sort_field, descending, &query, hits, &pages);
             }
-            let count = cache.records.iter().filter(|row| row.entity == entity).count();
-            cache.progress.insert(entity.clone(), Progress { loaded: count, hits: page.hits.max(count) });
-            drop(cache);
-            shared.generation.fetch_add(1, Ordering::Relaxed);
+            publish(&shared, true);
         }
+        Err(err) => fail_page(&shared, &entity, offset, &err.to_string()),
     }
 }
 
+fn fail_page(shared: &Shared, entity: &str, offset: u64, err: &str) {
+    if let Ok(mut slot) = shared.last_error.lock() {
+        *slot = Some(public_error(err));
+    }
+    let mut hub = lock(&shared.hub);
+    if let Some(view) = hub.views.get_mut(entity) {
+        view.inflight.remove(&offset);
+    }
+    drop(hub);
+    publish(shared, true);
+}
+
+fn record_search(shared: Arc<Shared>, model: Arc<ModelDefinition>, roots: Vec<String>, query: String, gen: u64) {
+    std::thread::sleep(Duration::from_millis(150));
+    if lock(&shared.hub).search_gen != gen {
+        return;
+    }
+    let mut hits = Vec::new();
+    for entity in roots {
+        if lock(&shared.hub).search_gen != gen {
+            return;
+        }
+        let Ok(body) = shared.http.search_window(&entity, &query, 0, 8, "", false) else { continue };
+        let Ok(page) = parse_search_page(&model, &entity, &body) else { continue };
+        let entity_label = model.entity(&entity).map(|entry| entry.label.clone()).unwrap_or_else(|| entity.clone());
+        for parsed in page.records {
+            let label = label_text(&model, &parsed.record);
+            let detail = parsed
+                .record
+                .values
+                .values()
+                .find_map(|value| match value {
+                    idmc_model::FieldValue::String(text) if !text.is_empty() && text != &label => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| parsed.record.id.clone());
+            hits.push(SearchHit {
+                entity: entity.clone(),
+                entity_label: entity_label.clone(),
+                id: parsed.record.id.clone(),
+                label,
+                detail,
+            });
+        }
+    }
+    if lock(&shared.hub).search_gen != gen {
+        return;
+    }
+    lock(&shared.hub).search_hits = Some(hits);
+    publish(&shared, true);
+}
+
+struct LoadedDisk {
+    hits: usize,
+    pages: BTreeMap<u64, Vec<Record>>,
+}
+
+fn cache_root() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("IDMC_CACHE") {
+        return std::path::PathBuf::from(dir);
+    }
+    if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
+        return std::path::PathBuf::from(dir).join("idmc-client");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home).join(".cache").join("idmc-client");
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        return std::path::PathBuf::from(home).join(".cache").join("idmc-client");
+    }
+    std::path::PathBuf::from(".idmc-cache")
+}
+
+fn cache_path(tenant: &str, entity: &str, sort: &str, descending: bool, query: &str) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tenant.hash(&mut hasher);
+    entity.hash(&mut hasher);
+    sort.hash(&mut hasher);
+    descending.hash(&mut hasher);
+    query.hash(&mut hasher);
+    let name = entity.replace(['/', '\\', ':'], "_");
+    cache_root().join(format!("{:x}", hasher.finish())).join(format!("{name}.json"))
+}
+
+fn read_disk(tenant: &str, entity: &str, sort: &str, descending: bool, query: &str) -> Option<LoadedDisk> {
+    let text = std::fs::read_to_string(cache_path(tenant, entity, sort, descending, query)).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let hits = value.get("hits")?.as_u64()? as usize;
+    let mut pages = BTreeMap::new();
+    for page in value.get("pages")?.as_array()? {
+        let offset = page.get("offset")?.as_u64()?;
+        let rows: Vec<Record> = serde_json::from_value(page.get("rows")?.clone()).ok()?;
+        pages.insert(offset, rows);
+    }
+    Some(LoadedDisk { hits, pages })
+}
+
+fn write_disk(tenant: &str, entity: &str, sort: &str, descending: bool, query: &str, hits: usize, pages: &BTreeMap<u64, Vec<Record>>) {
+    let path = cache_path(tenant, entity, sort, descending, query);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut stored = Vec::new();
+    for (offset, rows) in pages.iter().take(20) {
+        stored.push(serde_json::json!({"offset": offset, "rows": rows}));
+    }
+    let text = serde_json::json!({"hits": hits, "pages": stored}).to_string();
+    let _ = std::fs::write(path, text);
+}
+
+fn search_field_name(entity: &str, field: &str) -> String {
+    format!("{}.{}", entity.replace('.', ""), field)
+}
+
+fn search_clause(entity: &str, query: &str) -> (String, Option<Value>) {
+    let query = query.trim();
+    if query.is_empty() || query == "*" {
+        return ("*".into(), None);
+    }
+    if let Some((field, value)) = query.split_once('=') {
+        let field = field.trim();
+        let value = value.trim();
+        if !field.is_empty() && !field.contains(' ') {
+            let comparator = if value.is_empty() { "IS_MISSING" } else { "CONTAINS" };
+            let mut filter = serde_json::json!({
+                "comparator": comparator,
+                "fieldName": search_field_name(entity, field),
+            });
+            if !value.is_empty() {
+                filter["fieldValue"] = Value::String(value.to_string());
+            }
+            return ("*".into(), Some(serde_json::json!({"filter": [filter]})));
+        }
+    }
+    (query.to_string(), None)
+}
+
 fn remember(cache: &mut Cache, parsed: ParsedRecord) {
-    let key = format!("{}\0{}", parsed.record.entity, parsed.record.id);
+    let key = index_key(&parsed.record.entity, &parsed.record.id);
     if parsed.hydrated {
-        cache.hydrated.insert(key);
+        cache.hydrated.insert(key.clone());
     }
     for (lookup, code, name) in parsed.lookups {
         cache.lookups.insert((lookup, code), name);
     }
-    if let Some(slot) = cache
-        .records
-        .iter_mut()
-        .find(|row| row.entity == parsed.record.entity && row.id == parsed.record.id)
-    {
-        *slot = parsed.record;
+    if let Some(&pos) = cache.index.get(&key) {
+        cache.records[pos] = parsed.record;
     } else {
+        cache.index.insert(key, cache.records.len());
         cache.records.push(parsed.record);
     }
+}
+
+fn index_key(entity: &str, id: &str) -> String {
+    format!("{entity}\0{id}")
 }
 
 fn load_model(config: &LiveConfig) -> Result<ModelDefinition, BackendError> {
@@ -420,9 +910,10 @@ fn load_model(config: &LiveConfig) -> Result<ModelDefinition, BackendError> {
 }
 
 impl IdmcHttp {
-    fn connect(config: &LiveConfig) -> Result<Self, BackendError> {
+    fn connect(config: &LiveConfig, trace: bool) -> Result<Self, BackendError> {
         let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(45))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(READ_TIMEOUT)
             .pool_max_idle_per_host(0)
             .build()
             .map_err(|err| BackendError::Message(format!("http client: {err}")))?;
@@ -440,7 +931,14 @@ impl IdmcHttp {
             dump: Mutex::new(dump),
             session: Mutex::new(None),
             login_gate: Mutex::new(()),
+            trace,
         })
+    }
+
+    fn note(&self, line: &str) {
+        if self.trace {
+            step(line);
+        }
     }
 
     fn login(&self) -> Result<(), BackendError> {
@@ -450,43 +948,84 @@ impl IdmcHttp {
             "username": self.username,
             "password": self.password,
         });
+        self.note(&format!("login v3 POST {v3}"));
+        let started = Instant::now();
         let v3_result = self.post_once(&v3, &body, false);
         let session = match v3_result {
-            Ok((status, value)) if status == 200 => match parse_v3(&value) {
-                Ok((session_id, base)) => SessionInfo {
-                    session_id,
-                    mdm_base: mdm_base_from_api_url(&base)?,
-                    model_version: model_version_now(),
-                    api: "v3".into(),
-                },
-                Err(_) => self.login_v2(&v2, &body)?,
-            },
-            Ok((status, _)) if matches!(status, 404 | 405 | 501) => self.login_v2(&v2, &body)?,
-            Ok((status, _)) if status == 401 || status == 403 => {
-                return Err(BackendError::Message(format!("login failed: HTTP {status}")));
+            Ok((status, value, raw)) => {
+                self.note(&format!("login v3 HTTP {status} in {}ms", started.elapsed().as_millis()));
+                if status == 200 {
+                    match parse_v3(&value) {
+                        Ok((session_id, base)) => {
+                            let mdm = mdm_base_from_api_url(&base)?;
+                            self.note(&format!("baseApiUrl {base}"));
+                            self.note(&format!("mdm {mdm}"));
+                            SessionInfo {
+                                session_id,
+                                mdm_base: mdm,
+                                model_version: model_version_now(),
+                                api: "v3".into(),
+                            }
+                        }
+                        Err(err) => {
+                            self.note(&format!("login v3 response was not a session ({err})"));
+                            self.login_v2(&v2, &body)?
+                        }
+                    }
+                } else if status == 401 || status == 403 {
+                    let msg = format!("login failed: {}", failure_line(status, &raw));
+                    self.note(&msg);
+                    return Err(BackendError::Message(msg));
+                } else {
+                    let line = failure_line(status, &raw);
+                    self.note(&format!("login v3 {line}"));
+                    match self.login_v2(&v2, &body) {
+                        Ok(session) => session,
+                        Err(err) => {
+                            if matches!(status, 404 | 405 | 501) {
+                                return Err(err);
+                            }
+                            return Err(BackendError::Message(format!("login failed: {line}")));
+                        }
+                    }
+                }
             }
-            Ok((status, _)) => match self.login_v2(&v2, &body) {
-                Ok(session) => session,
-                Err(_) => return Err(BackendError::Message(format!("login failed: HTTP {status}"))),
-            },
-            Err(err) => return Err(err),
+            Err(err) => {
+                let msg = format!(
+                    "login v3 failed in {}ms: {}",
+                    started.elapsed().as_millis(),
+                    public_error(&err.to_string())
+                );
+                self.note(&msg);
+                return Err(BackendError::Message(msg));
+            }
         };
         *self.session.lock().unwrap_or_else(|err| err.into_inner()) = Some(session);
         Ok(())
     }
 
     fn login_v2(&self, url: &str, body: &Value) -> Result<SessionInfo, BackendError> {
-        let (status, value) = self.post_once(url, body, false)?;
+        self.note(&format!("login v2 POST {url}"));
+        let started = Instant::now();
+        let (status, value, raw) = self.post_once(url, body, false)?;
+        self.note(&format!("login v2 HTTP {status} in {}ms", started.elapsed().as_millis()));
         if status == 401 || status == 403 {
-            return Err(BackendError::Message(format!("login failed: HTTP {status}")));
+            let msg = format!("login failed: {}", failure_line(status, &raw));
+            self.note(&msg);
+            return Err(BackendError::Message(msg));
         }
         if status != 200 {
-            return Err(BackendError::Message(format!("login failed: v2 HTTP {status}")));
+            let msg = format!("login failed: v2 {}", failure_line(status, &raw));
+            self.note(&msg);
+            return Err(BackendError::Message(msg));
         }
         let (session_id, base) = parse_v2(&value).map_err(|err| BackendError::Message(err))?;
+        let mdm = mdm_base_from_api_url(&base)?;
+        self.note(&format!("baseApiUrl {base}"));
+        self.note(&format!("mdm {mdm}"));
         Ok(SessionInfo {
             session_id,
-            mdm_base: mdm_base_from_api_url(&base)?,
+            mdm_base: mdm,
             model_version: model_version_now(),
             api: "v2".into(),
         })
@@ -495,6 +1034,7 @@ impl IdmcHttp {
     fn search(&self, entity: &str, record_offset: u64, page: u64) -> Result<Value, BackendError> {
         let base = self.mdm_base().ok_or_else(|| BackendError::Message("not logged in".into()))?;
         let url = format!("{base}/search/public/api/v1/search");
+        self.note(&format!("search POST {url} entity {entity} offset {record_offset}"));
         let body = serde_json::json!({
             "entityType": entity,
             "search": "*",
@@ -503,6 +1043,39 @@ impl IdmcHttp {
             "recordOffset": record_offset,
             "recordsToReturn": page,
         });
+        self.post_json(&url, &body)
+    }
+
+    fn search_window(
+        &self,
+        entity: &str,
+        query: &str,
+        record_offset: u64,
+        page: u64,
+        sort_field: &str,
+        descending: bool,
+    ) -> Result<Value, BackendError> {
+        let base = self.mdm_base().ok_or_else(|| BackendError::Message("not logged in".into()))?;
+        let url = format!("{base}/search/public/api/v1/search");
+        let (search, filters) = search_clause(entity, query);
+        self.note(&format!("search POST {url} entity {entity} offset {record_offset} page {page}"));
+        let mut body = serde_json::json!({
+            "entityType": entity,
+            "search": search,
+            "pageSize": page,
+            "pageOffset": 0,
+            "recordOffset": record_offset,
+            "recordsToReturn": page,
+        });
+        if !sort_field.is_empty() {
+            body["sort"] = serde_json::json!([{
+                "fieldName": sort_field,
+                "order": if descending { "DESCENDING" } else { "ASCENDING" },
+            }]);
+        }
+        if let Some(filters) = filters {
+            body["filters"] = filters;
+        }
         self.post_json(&url, &body)
     }
 
@@ -519,29 +1092,37 @@ impl IdmcHttp {
     }
 
     fn send(&self, method: &str, url: &str, body: Option<&Value>) -> Result<Value, BackendError> {
+        let started = Instant::now();
         let mut relogin = false;
         let mut attempt = 0u32;
         loop {
             let response = self.dispatch(method, url, body)?;
             let status = response.status().as_u16();
             if status == 401 && !relogin {
+                self.note(&format!("{method} {url} HTTP 401 in {}ms, logging in again", started.elapsed().as_millis()));
                 self.login()?;
                 relogin = true;
                 continue;
             }
             if status == 429 && attempt < 5 {
                 let delay = retry_delay(attempt, response.headers().get("retry-after").and_then(|v| v.to_str().ok()));
+                self.note(&format!("{method} {url} HTTP 429, waiting {}ms", delay.as_millis()));
                 attempt += 1;
                 std::thread::sleep(delay);
                 continue;
             }
             let text = response.text().map_err(|err| BackendError::Message(format!("http: {err}")))?;
             self.dump_response(method, url, status, &text);
+            self.note(&format!("{method} {url} HTTP {status} in {}ms", started.elapsed().as_millis()));
             if status == 401 {
-                return Err(BackendError::Message("HTTP 401".into()));
+                let msg = failure_line(status, &text);
+                self.note(&msg);
+                return Err(BackendError::Message(msg));
             }
             if !(200..300).contains(&status) {
-                return Err(BackendError::Message(format!("HTTP {status}")));
+                let msg = failure_line(status, &text);
+                self.note(&msg);
+                return Err(BackendError::Message(msg));
             }
             if text.trim().is_empty() {
                 return Ok(Value::Null);
@@ -575,7 +1156,7 @@ impl IdmcHttp {
         request.send().map_err(|err| BackendError::Message(format!("http: {err}")))
     }
 
-    fn post_once(&self, url: &str, body: &Value, authed: bool) -> Result<(u16, Value), BackendError> {
+    fn post_once(&self, url: &str, body: &Value, authed: bool) -> Result<(u16, Value, String), BackendError> {
         let mut attempt = 0u32;
         loop {
             let mut request = self
@@ -602,7 +1183,7 @@ impl IdmcHttp {
             let text = response.text().unwrap_or_default();
             self.dump_response("POST", url, status, &text);
             let value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            return Ok((status, value));
+            return Ok((status, value, text));
         }
     }
 
@@ -979,6 +1560,28 @@ fn public_error(text: &str) -> String {
     trimmed.chars().take(180).collect()
 }
 
+fn failure_line(status: u16, body: &str) -> String {
+    format!("HTTP {status}: {}", preview_body(body))
+}
+
+fn preview_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "(empty body)".into();
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(mut value) => {
+            redact_json(&mut value);
+            let rendered = value.to_string();
+            if rendered.contains("eyJ") {
+                return "request failed".into();
+            }
+            rendered.chars().take(180).collect()
+        }
+        Err(_) => public_error(trimmed),
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
@@ -1001,6 +1604,18 @@ mod tests {
             "https://use4-mdm.dm-us.informaticacloud.com"
         );
         assert_eq!(
+            mdm_base_from_api_url("https://usw1.dmp-us.informaticacloud.com/saas").unwrap(),
+            "https://usw1-mdm.dmp-us.informaticacloud.com"
+        );
+        assert_eq!(
+            mdm_base_from_api_url("https://usw1-mdm.dmp-us.informaticacloud.com").unwrap(),
+            "https://usw1-mdm.dmp-us.informaticacloud.com"
+        );
+        assert_eq!(
+            mdm_base_from_api_url("https://emw1.dm-eu.informaticacloud.com/saas").unwrap(),
+            "https://emw1-mdm.dm-eu.informaticacloud.com"
+        );
+        assert_eq!(
             mdm_base_from_api_url("http://127.0.0.1:9/saas").unwrap().to_string(),
             "http://127.0.0.1:9"
         );
@@ -1021,6 +1636,14 @@ mod tests {
         assert_eq!(value["userInfo"]["name"], "kept");
         assert_eq!(value["icSessionId"], "***");
         assert_eq!(value["password"], "***");
+        let line = failure_line(
+            400,
+            r#"{"password":"s3cret-password","userInfo":{"sessionId":"sess-old"},"error":"nope"}"#,
+        );
+        assert!(line.starts_with("HTTP 400:"), "{line}");
+        assert!(!line.contains("s3cret-password"), "{line}");
+        assert!(!line.contains("sess-old"), "{line}");
+        assert!(line.contains("nope"), "{line}");
     }
 
     #[test]
@@ -1125,11 +1748,164 @@ mod tests {
         assert!(searches.load(AtomicOrdering::SeqCst) >= 3);
     }
 
+    #[test]
+    fn window_fetches_the_visible_page_not_the_entity() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let offsets = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let seen = Arc::clone(&offsets);
+        let base = stub(move |line, body| {
+            if line.contains("/login") {
+                (
+                    200,
+                    r#"{"products":[{"name":"Business 360","baseApiUrl":"BASE/saas"}],"userInfo":{"sessionId":"sess-win"}}"#.into(),
+                    "",
+                )
+            } else if line.contains("/search/") {
+                assert!(!body.contains("\"fields\""), "{body}");
+                assert!(body.contains("\"pageSize\":500") || body.contains("\"recordsToReturn\":8"), "{body}");
+                let offset = record_offset(body);
+                seen.lock().unwrap().push(offset);
+                let id = if offset == 3000 { "R3000" } else { "R0" };
+                let name = if offset == 3000 { "Late" } else { "Early" };
+                (
+                    200,
+                    format!(
+                        r#"{{"searchResult":{{"hits":4000,"records":[{{"_meta":{{"businessId":"{id}"}},"c360person.firstName":"{name}"}}]}}}}"#
+                    ),
+                    "",
+                )
+            } else {
+                (404, "{}".into(), "")
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("idmc-cache-{}", base.replace([':', '/'], "_")));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("IDMC_CACHE", &dir);
+        let config = LiveConfig {
+            login_url: base.clone(),
+            username: "user".into(),
+            password: "pw".into(),
+            export: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../mock/idmc-export/person")),
+            model_json: None,
+            values: None,
+            debug_dump: None,
+        };
+        let backend = LiveBackend::open(config).expect("open");
+        let started = Instant::now();
+        while !backend.master_known("c360.person") && started.elapsed() < Duration::from_secs(4) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(backend.master_known("c360.person"), "first window");
+        assert_eq!(backend.master_total("c360.person"), 4000);
+        assert!(backend.master_at("c360.person", 0).is_some());
+        backend.master_touch("c360.person", 3000, 3010);
+        let started = Instant::now();
+        while backend.master_at("c360.person", 3000).is_none() && started.elapsed() < Duration::from_secs(4) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(backend.master_at("c360.person", 3000).is_some(), "row 3000");
+        let got = offsets.lock().unwrap().clone();
+        assert!(got.contains(&0), "{got:?}");
+        assert!(got.contains(&3000), "{got:?}");
+        assert!(
+            got.iter().all(|offset| matches!(*offset, 0 | 500 | 2500 | 3000 | 3500)),
+            "unexpected page {got:?}"
+        );
+        let lines = backend.timing_lines();
+        assert!(lines.iter().any(|line| line.starts_with("timing: first rows")), "{lines:?}");
+        assert!(lines.iter().any(|line| line.starts_with("timing: row 3000")), "{lines:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn four_thousand_rows_sort_once_then_reuse() {
+        use std::sync::Arc;
+        use std::time::Instant;
+        use idmc_model::FieldValue;
+        let model = person_model();
+        let records: Vec<Record> = (0..4000)
+            .map(|index| {
+                let mut values = BTreeMap::new();
+                values.insert("firstName".into(), FieldValue::String(format!("N{index:04}")));
+                values.insert(
+                    "lastName".into(),
+                    FieldValue::String(format!("L{:04}", (index * 17) % 4000)),
+                );
+                Record {
+                    entity: "c360.person".into(),
+                    id: format!("id{index:04}"),
+                    values,
+                }
+            })
+            .collect();
+        let started = Instant::now();
+        let mut walked = 0usize;
+        for _ in 0..20 {
+            let rows = crate::records_of(&model, &records, "c360.person");
+            walked += rows.len();
+            for row in &rows {
+                walked += crate::label_text(&model, row).len();
+            }
+        }
+        let before = started.elapsed();
+        let backend = crate::MockBackend::from_records_unchecked(model.clone(), records);
+        let shared = backend.shared_records("c360.person");
+        let started = Instant::now();
+        let mut visible = 0usize;
+        for _ in 0..20 {
+            let page = backend.shared_records("c360.person");
+            assert!(Arc::ptr_eq(&shared, &page));
+            for row in page.iter().take(40) {
+                visible += crate::label_text(&model, row).len();
+            }
+        }
+        let after = started.elapsed();
+        let painted = painted_rows(4000, 700.0, 28.0);
+        eprintln!(
+            "4000 persons, 20 frames: full sort+walk every row {before:?} ({walked} touches, 4000 elements); cached list + 40 visible rows {after:?} ({visible} touches, {painted} elements at 700px/28px)"
+        );
+        let clock = Instant::now();
+        let total = backend.master_total("c360.person");
+        let _ = backend.master_at("c360.person", 0);
+        let first_rows = clock.elapsed();
+        let clock = Instant::now();
+        let row = backend.master_at("c360.person", 3000).expect("row 3000");
+        let scroll = clock.elapsed();
+        eprintln!(
+            "timing: first rows {}us (1 of {total})",
+            first_rows.as_micros()
+        );
+        eprintln!("timing: row 3000 ready {}us ({})", scroll.as_micros(), row.id);
+        assert_eq!(shared.len(), 4000);
+        assert!(painted < 40, "visible window {painted}");
+        assert!(
+            after.as_micros() * 8 < before.as_micros().max(1) || after.as_millis() < 50,
+            "before {before:?} after {after:?}"
+        );
+    }
+
+    fn painted_rows(total: usize, viewport_px: f32, row_px: f32) -> usize {
+        let last = (viewport_px / row_px).ceil() as usize;
+        last.min(total)
+    }
+
     fn person_model() -> ModelDefinition {
         IdmcExportSource::open(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../mock/idmc-export/person"))
             .unwrap()
             .load()
             .unwrap()
+    }
+
+    fn record_offset(body: &str) -> u64 {
+        let key = "\"recordOffset\":";
+        let Some(start) = body.find(key) else { return 0 };
+        body[start + key.len()..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
     }
 
     fn stub(handler: impl Fn(&str, &str) -> (u16, String, &'static str) + Send + Sync + 'static) -> String {

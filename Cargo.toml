@@ -19,6 +19,12 @@ idmc-layout = { path = "crates/layout" }
 [profile.dev]
 debug = 0
 
+# GPUI and the HTTP stack stay optimized in debug builds. This crate is left
+# at opt-level 0 so incremental compiles stay short. `cargo run --release` is
+# the build to use against a live org.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 debug = 0
 

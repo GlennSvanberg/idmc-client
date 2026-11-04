@@ -74,7 +74,7 @@ impl Render for Ghost {
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(rgb(0x1a4552))
+            .bg(rgb(0x143d2c))
             .text_color(rgb(0xe7e9ee))
             .text_size(px(12.))
             .child(self.title.clone())
@@ -91,11 +91,15 @@ impl Root {
     fn new(session: Session, cx: &mut Context<Self>) -> Self {
         cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(Duration::from_millis(400)).await;
+                Timer::after(Duration::from_millis(150)).await;
                 if this
                     .update(cx, |root, cx| {
-                        if root.session.backend.poll() {
+                        let loaded = root.session.backend.poll();
+                        let extra = root.session.absorb_async();
+                        if loaded {
                             root.session.reconcile();
+                        }
+                        if loaded || extra {
                             cx.notify();
                         }
                     })
@@ -120,6 +124,10 @@ impl Root {
             "theme.toggle"
                 | "workspace.save"
                 | "workspace.reset"
+                | "workspace.new"
+                | "workspace.duplicate"
+                | "workspace.rename"
+                | "workspace.close"
                 | "view.close"
                 | "view.zoom"
                 | "view.move_left"
@@ -178,7 +186,7 @@ impl Root {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.to_ascii_lowercase();
         let mods = &event.keystroke.modifiers;
-        let editing = self.session.palette.open || self.session.chooser_for.is_some();
+        let editing = self.session.palette.open || self.session.chooser_for.is_some() || self.session.filter_for.is_some();
         if !editing {
             if key == "escape" {
                 self.session.escape();
@@ -206,6 +214,8 @@ impl Root {
                     if effect == Effect::Quit {
                         cx.quit();
                     }
+                } else if let Some(view) = self.session.filter_for.clone() {
+                    self.session.apply_filter(&view);
                 }
             }
             "backspace" => self.session.backspace(),
@@ -245,6 +255,8 @@ impl Root {
             },
             PaletteMode::PickLink(_) => "Source link",
             PaletteMode::OpenView => "Open view",
+            PaletteMode::PickTemplate => "New workspace",
+            PaletteMode::RenameWorkspace => "Rename workspace",
         };
         let mut list = div()
             .id("palette-list")
@@ -270,7 +282,7 @@ impl Root {
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(theme.hover)))
                     .child(div().flex_1().child(row.title.clone()))
-                    .child(div().text_size(px(11.)).text_color(rgb(theme.subtle)).child(row.shortcut.clone()))
+                    .child(div().text_size(px(11.)).text_color(rgb(theme.subtle)).child(if row.hit.is_some() { row.detail.clone() } else { row.shortcut.clone() }))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.session.palette.cursor = index;
                         let effect = this.session.confirm_palette();
@@ -312,7 +324,17 @@ impl Root {
                                 div()
                                     .text_size(px(14.))
                                     .text_color(rgb(theme.text))
-                                    .child(render_edit_line(&self.session.palette.edit, "Type to filter", theme)),
+                                    .child(render_edit_line(
+                                        &self.session.palette.edit,
+                                        if matches!(self.session.palette.mode, PaletteMode::Commands) {
+                                            "Command or record name"
+                                        } else if matches!(self.session.palette.mode, PaletteMode::RenameWorkspace) {
+                                            "Workspace name"
+                                        } else {
+                                            "Type to filter"
+                                        },
+                                        theme,
+                                    )),
                             ),
                     )
                     .child(list),
@@ -442,6 +464,7 @@ impl Render for Root {
                 }
             }))
             .child(self.chrome(&summary, &theme, cx))
+            .child(self.workspace_bar(&theme, cx))
             .child(div().flex_1().min_h_0().p_2().child(surface))
             .child(self.status_bar(&theme));
         if let Some(palette) = palette {
@@ -455,7 +478,59 @@ impl Render for Root {
 }
 
 impl Root {
+    fn workspace_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut bar = div()
+            .h(px(32.))
+            .px_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .bg(rgb(theme.bg))
+            .border_b_1()
+            .border_color(rgb(theme.border));
+        for (index, name) in self.session.file.tab_names().into_iter().enumerate() {
+            let on = index == self.session.file.active;
+            bar = bar.child(
+                div()
+                    .id(SharedString::from(format!("ws-{index}")))
+                    .px_2()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .bg(rgb(if on { theme.raised } else { theme.bg }))
+                    .text_color(rgb(if on { theme.text } else { theme.muted }))
+                    .border_b_1()
+                    .border_color(rgb(if on { theme.accent } else { theme.bg }))
+                    .child(name)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.session.switch_workspace(index);
+                        cx.notify();
+                    })),
+            );
+        }
+        bar.child(
+            div()
+                .id("ws-add")
+                .px_2()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .text_color(rgb(theme.accent))
+                .child("+")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.exec("workspace.new", cx);
+                })),
+        )
+    }
+
     fn chrome(&self, summary: &str, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let connection = self.session.backend.connection();
+        let live = connection.starts_with("Live");
         div()
             .h(px(40.))
             .px_3()
@@ -470,12 +545,8 @@ impl Root {
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(if self.session.backend.connection().starts_with("Live") {
-                        theme.ok
-                    } else {
-                        theme.muted
-                    }))
-                    .child(self.session.backend.connection()),
+                    .text_color(rgb(if live { theme.ok } else { theme.muted }))
+                    .child(connection),
             )
             .child(div().text_size(px(11.)).text_color(rgb(theme.muted)).child(summary.to_string()))
             .child(div().flex_1())

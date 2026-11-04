@@ -2,8 +2,10 @@
 //! loaded model plus a JSON record file. A live IDMC implementation can
 //! replace it later without changing views.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use idmc_model::{
     compose_label, load_records, validate_values, value_at, Cardinality, FieldSide, FieldValue,
@@ -36,6 +38,37 @@ pub trait Backend {
     fn connection(&self) -> String { "Mock".into() }
     /// Display name captured from a live lookup `{Code, Name}` object.
     fn lookup_name(&self, _lookup: Option<&str>, _code: &str) -> Option<String> { None }
+    /// Bumps when the record set changes. Views cache sorts against this.
+    fn generation(&self) -> u64 { 0 }
+    /// Sorted records for one entity, shared until `generation` changes.
+    fn shared_records(&self, entity: &str) -> Arc<Vec<Record>> {
+        Arc::new(self.records(entity))
+    }
+    /// Total rows for a master table. Live lists report the server hit count
+    /// before every row has been fetched.
+    fn master_total(&self, entity: &str) -> usize {
+        self.shared_records(entity).len()
+    }
+    fn master_known(&self, _entity: &str) -> bool { true }
+    fn master_at(&self, entity: &str, index: usize) -> Option<Record> {
+        self.shared_records(entity).get(index).cloned()
+    }
+    /// Ask a live list to fetch the pages covering this range. Mock data is local.
+    fn master_touch(&self, _entity: &str, _start: usize, _end: usize) {}
+    fn set_master_view(&self, _entity: &str, _query: &str, _sort_field: Option<&str>, _descending: bool) {}
+    fn search_records(&self, _query: &str, _limit: usize) -> Vec<SearchHit> { Vec::new() }
+    fn schedule_record_search(&self, _query: &str) {}
+    fn take_record_search(&self) -> Option<Vec<SearchHit>> { None }
+    fn timing_lines(&self) -> Vec<String> { Vec::new() }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub entity: String,
+    pub entity_label: String,
+    pub id: String,
+    pub label: String,
+    pub detail: String,
 }
 
 mod config;
@@ -45,16 +78,52 @@ pub use config::{load_dotenv, read_env, BackendMode, EnvConfig};
 pub use live::{check_login, mdm_base_from_api_url, LiveBackend, LiveConfig};
 
 #[derive(Clone, Debug)]
+struct ListCache {
+    generation: u64,
+    lists: HashMap<String, Arc<Vec<Record>>>,
+}
+
+impl Default for ListCache {
+    fn default() -> Self {
+        Self { generation: u64::MAX, lists: HashMap::new() }
+    }
+}
+
+#[derive(Clone)]
+struct MasterView {
+    query: String,
+    sort_field: Option<String>,
+    descending: bool,
+}
+
 pub struct MockBackend {
     model: ModelDefinition,
     records: Vec<Record>,
+    generation: u64,
+    lists: RefCell<ListCache>,
+    view_state: RefCell<HashMap<String, MasterView>>,
 }
 
 impl MockBackend {
     pub fn from_parts(model: ModelDefinition, records: Vec<Record>) -> Result<Self, BackendError> {
-        let backend = Self { model, records };
+        let backend = Self::with_records(model, records, 1);
         backend.validate_dataset()?;
         Ok(backend)
+    }
+
+    /// Records that skip dataset validation. Used to time large lists.
+    pub fn from_records_unchecked(model: ModelDefinition, records: Vec<Record>) -> Self {
+        Self::with_records(model, records, 1)
+    }
+
+    fn with_records(model: ModelDefinition, records: Vec<Record>, generation: u64) -> Self {
+        Self {
+            model,
+            records,
+            generation,
+            lists: RefCell::new(ListCache::default()),
+            view_state: RefCell::new(HashMap::new()),
+        }
     }
 
     pub fn open_default() -> Result<Self, BackendError> {
@@ -94,12 +163,11 @@ impl MockBackend {
 
     pub fn reload_data(&mut self, json: &str) -> Result<(), BackendError> {
         let records = load_records(json)?;
-        let trial = Self {
-            model: self.model.clone(),
-            records,
-        };
+        let trial = Self::with_records(self.model.clone(), records, self.generation);
         trial.validate_dataset()?;
         self.records = trial.records;
+        self.generation = self.generation.wrapping_add(1);
+        self.lists.borrow_mut().lists.clear();
         Ok(())
     }
 
@@ -132,17 +200,111 @@ impl MockBackend {
 
 }
 
+impl MockBackend {
+    fn cached(&self, key: &str, build: impl FnOnce() -> Vec<Record>) -> Arc<Vec<Record>> {
+        let generation = self.generation;
+        {
+            let mut slot = self.lists.borrow_mut();
+            if slot.generation != generation {
+                slot.lists.clear();
+                slot.generation = generation;
+            }
+            if let Some(hit) = slot.lists.get(key) {
+                return Arc::clone(hit);
+            }
+        }
+        let rows = Arc::new(build());
+        let mut slot = self.lists.borrow_mut();
+        if slot.generation != generation {
+            slot.lists.clear();
+            slot.generation = generation;
+        }
+        slot.lists.insert(key.to_string(), Arc::clone(&rows));
+        rows
+    }
+}
+
 impl Backend for MockBackend {
     fn model(&self) -> &ModelDefinition { &self.model }
-    fn records(&self, entity: &str) -> Vec<Record> { records_of(&self.model, &self.records, entity) }
+    fn records(&self, entity: &str) -> Vec<Record> { self.shared_records(entity).as_ref().clone() }
+    fn shared_records(&self, entity: &str) -> Arc<Vec<Record>> {
+        let view = self.view_state.borrow().get(entity).cloned();
+        let key = match &view {
+            Some(view) => format!(
+                "records\0{entity}\0{}\0{}\0{}",
+                view.query,
+                view.sort_field.clone().unwrap_or_default(),
+                view.descending
+            ),
+            None => format!("records\0{entity}"),
+        };
+        let model = &self.model;
+        let records = &self.records;
+        self.cached(&key, || {
+            let mut rows = records_of(model, records, entity);
+            if let Some(view) = &view {
+                if let Some(field) = &view.sort_field {
+                    let field = field.clone();
+                    let descending = view.descending;
+                    rows.sort_by(|left, right| {
+                        let order = text_at(left, &field).cmp(&text_at(right, &field)).then_with(|| left.id.cmp(&right.id));
+                        if descending { order.reverse() } else { order }
+                    });
+                }
+                if !view.query.trim().is_empty() {
+                    let query = view.query.to_ascii_lowercase();
+                    rows.retain(|row| record_blob(row).contains(&query));
+                }
+            }
+            rows
+        })
+    }
     fn record(&self, entity: &str, id: &str) -> Option<Record> { record_of(&self.model, &self.records, entity, id) }
     fn label(&self, entity: &str, id: &str) -> String { label_of(&self.model, &self.records, entity, id) }
     fn related(&self, relationship: &str, source_id: &str) -> Result<Vec<Record>, BackendError> {
-        related_of(&self.model, &self.records, relationship, source_id)
+        let key = format!("rel\0{relationship}\0{source_id}");
+        {
+            let slot = self.lists.borrow();
+            if slot.generation == self.generation {
+                if let Some(hit) = slot.lists.get(&key) {
+                    return Ok(hit.as_ref().clone());
+                }
+            }
+        }
+        let rows = related_of(&self.model, &self.records, relationship, source_id)?;
+        self.cached(&key, || rows.clone());
+        Ok(rows)
     }
-    fn hierarchy_roots(&self, entity: &str) -> Vec<Record> { hierarchy_roots_of(&self.model, &self.records, entity) }
+    fn hierarchy_roots(&self, entity: &str) -> Vec<Record> {
+        self.cached(&format!("roots\0{entity}"), || hierarchy_roots_of(&self.model, &self.records, entity))
+            .as_ref()
+            .clone()
+    }
     fn hierarchy_children(&self, entity: &str, id: &str) -> Vec<Record> {
-        hierarchy_children_of(&self.model, &self.records, entity, id)
+        self.cached(&format!("kids\0{entity}\0{id}"), || {
+            hierarchy_children_of(&self.model, &self.records, entity, id)
+        })
+        .as_ref()
+        .clone()
+    }
+    fn generation(&self) -> u64 { self.generation }
+    fn master_total(&self, entity: &str) -> usize { self.shared_records(entity).len() }
+    fn master_at(&self, entity: &str, index: usize) -> Option<Record> {
+        self.shared_records(entity).get(index).cloned()
+    }
+    fn set_master_view(&self, entity: &str, query: &str, sort_field: Option<&str>, descending: bool) {
+        self.view_state.borrow_mut().insert(
+            entity.to_string(),
+            MasterView {
+                query: query.trim().to_string(),
+                sort_field: sort_field.map(str::to_string),
+                descending,
+            },
+        );
+        self.lists.borrow_mut().lists.clear();
+    }
+    fn search_records(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        search_local(&self.model, &self.records, query, limit)
     }
 }
 
@@ -266,16 +428,19 @@ pub(crate) fn hierarchy_children_of(
     sort_by_label(model, rows)
 }
 
-fn sort_by_label(model: &ModelDefinition, mut rows: Vec<Record>) -> Vec<Record> {
-    rows.sort_by(|a, b| {
-        label_text(model, a)
-            .cmp(&label_text(model, b))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    rows
+fn sort_by_label(model: &ModelDefinition, rows: Vec<Record>) -> Vec<Record> {
+    let mut keyed: Vec<(String, Record)> = rows
+        .into_iter()
+        .map(|row| {
+            let label = label_text(model, &row);
+            (label, row)
+        })
+        .collect();
+    keyed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.id.cmp(&right.1.id)));
+    keyed.into_iter().map(|(_, row)| row).collect()
 }
 
-fn label_text(model: &ModelDefinition, record: &Record) -> String {
+pub(crate) fn label_text(model: &ModelDefinition, record: &Record) -> String {
     let Some(entity) = model.entity(&record.entity) else {
         return record.id.clone();
     };
@@ -484,6 +649,141 @@ impl Backend for AppBackend {
             AppBackend::Live(backend) => backend.lookup_name(lookup, code),
         }
     }
+    fn generation(&self) -> u64 {
+        match self {
+            AppBackend::Mock(backend) => backend.generation(),
+            AppBackend::Live(backend) => backend.generation(),
+        }
+    }
+    fn shared_records(&self, entity: &str) -> Arc<Vec<Record>> {
+        match self {
+            AppBackend::Mock(backend) => backend.shared_records(entity),
+            AppBackend::Live(backend) => backend.shared_records(entity),
+        }
+    }
+    fn master_total(&self, entity: &str) -> usize {
+        match self {
+            AppBackend::Mock(backend) => backend.master_total(entity),
+            AppBackend::Live(backend) => backend.master_total(entity),
+        }
+    }
+    fn master_known(&self, entity: &str) -> bool {
+        match self {
+            AppBackend::Mock(backend) => backend.master_known(entity),
+            AppBackend::Live(backend) => backend.master_known(entity),
+        }
+    }
+    fn master_at(&self, entity: &str, index: usize) -> Option<Record> {
+        match self {
+            AppBackend::Mock(backend) => backend.master_at(entity, index),
+            AppBackend::Live(backend) => backend.master_at(entity, index),
+        }
+    }
+    fn master_touch(&self, entity: &str, start: usize, end: usize) {
+        if let AppBackend::Live(backend) = self {
+            backend.master_touch(entity, start, end);
+        }
+    }
+    fn set_master_view(&self, entity: &str, query: &str, sort_field: Option<&str>, descending: bool) {
+        match self {
+            AppBackend::Mock(backend) => backend.set_master_view(entity, query, sort_field, descending),
+            AppBackend::Live(backend) => backend.set_master_view(entity, query, sort_field, descending),
+        }
+    }
+    fn search_records(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        match self {
+            AppBackend::Mock(backend) => backend.search_records(query, limit),
+            AppBackend::Live(backend) => backend.search_records(query, limit),
+        }
+    }
+    fn schedule_record_search(&self, query: &str) {
+        if let AppBackend::Live(backend) = self {
+            backend.schedule_record_search(query);
+        }
+    }
+    fn take_record_search(&self) -> Option<Vec<SearchHit>> {
+        match self {
+            AppBackend::Mock(_) => None,
+            AppBackend::Live(backend) => backend.take_record_search(),
+        }
+    }
+    fn timing_lines(&self) -> Vec<String> {
+        match self {
+            AppBackend::Mock(_) => Vec::new(),
+            AppBackend::Live(backend) => backend.timing_lines(),
+        }
+    }
+}
+
+fn text_at(record: &Record, field: &str) -> String {
+    match value_at(&record.values, field) {
+        Some(FieldValue::String(text)) => text.clone(),
+        Some(FieldValue::List(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                FieldValue::String(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => String::new(),
+    }
+}
+
+fn record_blob(record: &Record) -> String {
+    let mut parts = vec![record.id.to_ascii_lowercase()];
+    for (key, value) in &record.values {
+        if let FieldValue::String(text) = value {
+            parts.push(key.to_ascii_lowercase());
+            parts.push(text.to_ascii_lowercase());
+        }
+    }
+    parts.join(" ")
+}
+
+fn search_local(model: &ModelDefinition, records: &[Record], query: &str, limit: usize) -> Vec<SearchHit> {
+    let query = query.trim().to_ascii_lowercase();
+    if query.len() < 2 {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for entity in model.entities.iter().filter(|entity| entity.embedded_in.is_none()) {
+        let mut found = 0usize;
+        let rows = records_of(model, records, &entity.id);
+        for row in rows {
+            let label = label_text(model, &row);
+            let detail = key_detail(entity, &row, &label);
+            let blob = format!("{} {} {}", label, detail, record_blob(&row)).to_ascii_lowercase();
+            if !blob.contains(&query) {
+                continue;
+            }
+            hits.push(SearchHit {
+                entity: entity.id.clone(),
+                entity_label: entity.label.clone(),
+                id: row.id.clone(),
+                label,
+                detail,
+            });
+            found += 1;
+            if found >= limit {
+                break;
+            }
+        }
+    }
+    hits
+}
+
+fn key_detail(entity: &idmc_model::EntityType, record: &Record, label: &str) -> String {
+    for field in entity.leaves() {
+        if field.system || entity.label_fields.iter().any(|path| path == &field.id) {
+            continue;
+        }
+        let text = text_at(record, &field.id);
+        if !text.is_empty() && text != label {
+            return text;
+        }
+    }
+    record.id.clone()
 }
 
 #[cfg(test)]

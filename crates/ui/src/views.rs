@@ -1,6 +1,10 @@
 //! Table, detail, and tree views. Every label and column comes from the model.
 
-use gpui::{div, px, prelude::*, rgb, AnyElement, Context, MouseButton, MouseDownEvent, SharedString};
+use gpui::{
+    div, px, prelude::*, rgb, uniform_list, AnyElement, Context, ListHorizontalSizingBehavior,
+    MouseButton, MouseDownEvent, SharedString,
+};
+use idmc_model::Record;
 use idmc_backend::Backend;
 use idmc_model::{FieldType, FieldValue, ViewKind};
 
@@ -26,7 +30,7 @@ impl Root {
         let count = if kind == Some(ViewKind::Tree) {
             self.session.tree_rows(self.session.spec(id).map(|s| s.entity.as_str()).unwrap_or("")).len()
         } else {
-            self.session.rows(id).len()
+            self.session.table_len(id)
         };
         let menu_id = id.to_string();
         let fields_id = id.to_string();
@@ -41,6 +45,28 @@ impl Root {
             .border_color(rgb(theme.border))
             .child(div().text_size(px(13.)).child(title))
             .child(div().text_size(px(11.)).text_color(rgb(theme.muted)).child(format!("{count}")))
+            .when(self.session.is_master_table(id), |el| {
+                let view = id.to_string();
+                let filtering = self.session.filter_for.as_deref() == Some(id);
+                let mut row = el.child(self.header_button(id, "Filter", theme, cx, move |this, cx| {
+                    let current = this.session.spec(&view).map(|spec| spec.query.clone()).unwrap_or_default();
+                    this.session.filter_edit = crate::edit::TextEdit::new();
+                    for ch in current.chars() {
+                        this.session.filter_edit.insert(ch);
+                    }
+                    this.session.filter_for = Some(view.clone());
+                    cx.notify();
+                }));
+                if filtering {
+                    row = row.child(
+                        div()
+                            .w(px(180.))
+                            .text_size(px(12.))
+                            .child(crate::edit::render_edit_line(&self.session.filter_edit, "Search or field=value", theme)),
+                    );
+                }
+                row
+            })
             .when(caption.is_some(), |el| {
                 el.child(
                     div()
@@ -93,77 +119,132 @@ impl Root {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows = self.session.rows(id);
+        let master = self.session.is_master_table(id);
+        let rows = if master { std::sync::Arc::new(Vec::new()) } else { self.session.rows_cached(id) };
         let selected = self.session.file.selections.get(id).cloned();
+        let column_labels: Vec<String> = columns
+            .iter()
+            .map(|column| {
+                self.session
+                    .backend
+                    .model()
+                    .entity(entity)
+                    .and_then(|ent| ent.field(column))
+                    .map(|field| field.label.clone())
+                    .unwrap_or_else(|| column.clone())
+            })
+            .collect();
         let mut header = div().flex().flex_row().h(px(28.)).bg(rgb(theme.raised)).items_center();
-        for column in columns {
-            let label = self
-                .session
-                .backend
-                .model()
-                .entity(entity)
-                .and_then(|ent| ent.field(column))
-                .map(|field| field.label.clone())
-                .unwrap_or_else(|| column.clone());
-            header = header.child(
-                div()
-                    .w(px(148.))
-                    .flex_shrink_0()
-                    .px_2()
-                    .text_size(px(11.))
-                    .text_color(rgb(theme.muted))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(label),
-            );
+        for (column, label) in columns.iter().zip(column_labels.iter()) {
+            let cell = div()
+                .w(px(148.))
+                .flex_shrink_0()
+                .px_2()
+                .text_size(px(11.))
+                .text_color(rgb(theme.muted))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(label.clone());
+            if master {
+                let view_id = id.to_string();
+                let field = column.clone();
+                header = header.child(
+                    cell.id(SharedString::from(format!("sort-{id}-{column}")))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                            this.session.toggle_sort(&view_id, &field);
+                            cx.notify();
+                        })),
+                );
+                continue;
+            }
+            header = header.child(cell);
         }
-        let mut body = div()
-            .id(SharedString::from(format!("rows-{id}")))
+        let width = px(148. * columns.len().max(1) as f32);
+        let body = if master {
+            self.session.sync_master(id);
+            let total = self.session.backend.master_total(entity);
+            let known = self.session.backend.master_known(entity);
+            if !known {
+                div().flex_1().p_4().text_color(rgb(theme.muted)).child("Loading the first window…").into_any_element()
+            } else if total == 0 {
+                div().flex_1().p_4().text_color(rgb(theme.muted)).child("No records match.").into_any_element()
+            } else {
+                let theme = *theme;
+                let entity = entity.to_string();
+                let columns = columns.to_vec();
+                let view_id = id.to_string();
+                let selected = selected.clone();
+                let this = cx.weak_entity();
+                uniform_list(SharedString::from(format!("rows-{id}")), total, move |range, _window, app| {
+                    let entity = entity.clone();
+                    let columns = columns.clone();
+                    let view_id = view_id.clone();
+                    let selected = selected.clone();
+                    this.update(app, |root, cx| {
+                        root.session.backend.master_touch(&entity, range.start, range.end);
+                        let mut items = Vec::with_capacity(range.len());
+                        for index in range {
+                            if let Some(row) = root.session.backend.master_at(&entity, index) {
+                                let on = selected.as_deref() == Some(row.id.as_str());
+                                items.push(root.table_row(index, &view_id, &entity, &columns, &row, on, &theme, cx));
+                            } else {
+                                items.push(root.placeholder_row(index, &view_id, &theme));
+                            }
+                        }
+                        items
+                    })
+                    .unwrap_or_default()
+                })
+                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                .flex_1()
+                .min_h_0()
+                .w(width)
+                .into_any_element()
+            }
+        } else if rows.is_empty() {
+            div()
+                .flex_1()
+                .min_h_0()
+                .p_4()
+                .text_color(rgb(theme.muted))
+                .child("No records. Select a source row, or clear the link to see every record.")
+                .into_any_element()
+        } else {
+            let theme = *theme;
+            let entity = entity.to_string();
+            let columns = columns.to_vec();
+            let view_id = id.to_string();
+            let this = cx.weak_entity();
+            uniform_list(
+                SharedString::from(format!("rows-{id}")),
+                rows.len(),
+                move |range, _window, app| {
+                    let rows = rows.clone();
+                    let entity = entity.clone();
+                    let columns = columns.clone();
+                    let view_id = view_id.clone();
+                    let selected = selected.clone();
+                    this.update(app, |root, cx| {
+                        let mut items = Vec::with_capacity(range.len());
+                        for index in range {
+                            let Some(row) = rows.get(index) else { continue };
+                            let on = selected.as_deref() == Some(row.id.as_str());
+                            items.push(root.table_row(
+                                index, &view_id, &entity, &columns, row, on, &theme, cx,
+                            ));
+                        }
+                        items
+                    })
+                    .unwrap_or_default()
+                },
+            )
+            .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col();
-        if rows.is_empty() {
-            body = body.child(
-                div()
-                    .p_4()
-                    .text_color(rgb(theme.muted))
-                    .child("No records. Select a source row, or clear the link to see every record."),
-            );
-        }
-        for (index, row) in rows.iter().enumerate() {
-            let on = selected.as_deref() == Some(row.id.as_str());
-            let view_id = id.to_string();
-            let record_id = row.id.clone();
-            let mut line = div()
-                .id(SharedString::from(format!("row-{id}-{index}")))
-                .flex()
-                .flex_row()
-                .flex_shrink_0()
-                .h(px(28.))
-                .items_center()
-                .cursor_pointer()
-                .bg(rgb(if on { theme.accent_dim } else { theme.panel }))
-                .hover(|style| style.bg(rgb(if on { theme.accent_dim } else { theme.hover })))
-                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                    this.session.select(&view_id, &record_id);
-                    cx.notify();
-                }));
-            for column in columns {
-                line = line.child(
-                    div()
-                        .w(px(148.))
-                        .flex_shrink_0()
-                        .px_2()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_size(px(12.))
-                        .child(self.session.cell(entity, column, row)),
-                );
-            }
-            body = body.child(line);
-        }
+            .w(width)
+            .into_any_element()
+        };
         let chooser = if self.session.chooser_for.as_deref() == Some(id) {
             Some(self.render_chooser(id, entity, columns, theme, cx))
         } else {
@@ -184,10 +265,65 @@ impl Root {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .child(header)
+                    .child(header.w(width))
                     .child(body),
             )
             .children(chooser)
+            .into_any_element()
+    }
+
+    fn table_row(
+        &self,
+        index: usize,
+        view_id: &str,
+        entity: &str,
+        columns: &[String],
+        row: &Record,
+        on: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view_id = view_id.to_string();
+        let record_id = row.id.clone();
+        let mut line = div()
+            .id(SharedString::from(format!("row-{view_id}-{index}")))
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .h(px(28.))
+            .items_center()
+            .cursor_pointer()
+            .bg(rgb(if on { theme.accent_dim } else { theme.panel }))
+            .hover(|style| style.bg(rgb(if on { theme.accent_dim } else { theme.hover })))
+            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                this.session.select(&view_id, &record_id);
+                cx.notify();
+            }));
+        for column in columns {
+            line = line.child(
+                div()
+                    .w(px(148.))
+                    .flex_shrink_0()
+                    .px_2()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(12.))
+                    .child(self.session.cell(entity, column, row)),
+            );
+        }
+        line.into_any_element()
+    }
+
+    fn placeholder_row(&self, index: usize, view_id: &str, theme: &Theme) -> AnyElement {
+        div()
+            .id(SharedString::from(format!("row-{view_id}-{index}")))
+            .flex()
+            .items_center()
+            .h(px(28.))
+            .px_2()
+            .text_size(px(12.))
+            .text_color(rgb(theme.subtle))
+            .child("…")
             .into_any_element()
     }
 

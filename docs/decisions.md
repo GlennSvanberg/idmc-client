@@ -37,11 +37,15 @@ Login is v3 `POST {login}/saas/public/core/v3/login` (`products[].baseApiUrl`, `
 
 Search is `POST {mdm}/search/public/api/v1/search` with `entityType`, `search: "*"`, `pageSize`, `recordOffset`, and `recordsToReturn`. `fields` is not sent in the same body. Record ids are `_meta.businessId`. Search field names are prefixed with the entity id with the dots removed (`c360person.firstName`). The read API, `GET {mdm}/business-entity/public/api/v1/entity/{businessEntity}/{businessId}`, uses unprefixed names. Lookup values are `{Code, Name}` and the name is shown even when `reference-values.json` does not list that code. `_meta.id` is not used as the record id. `_contentMeta` is not stored.
 
-The first search page of each master entity is loaded before the window opens. Further pages run on a background thread. A 401 logs in once and retries. A 429 honors `Retry-After` (capped at 30s) or waits with a short backoff. `--check-login` prints whether login and one search worked and does not open a window. `--debug-dump` writes responses with session ids and passwords replaced by `***`.
+A master table is a window, not a download. The first search returns the hit count and 500 rows. Scrolling fetches the window under the viewport, four requests at a time, sorted by the server. The client does not sort those rows again. `search` and `fields` are not sent together. A disk cache per host and entity paints the last snapshot immediately. An Egress job into a local index is the alternative if a window is not enough; it is described in `docs/performance.md` and not implemented. A 401 logs in once and retries. A 429 honors `Retry-After` (capped at 30s) or waits with a short backoff. Connect times out at 15 seconds and a read at 60. `--check-login` prints each step and does not open a window. `--debug-dump` writes responses with session ids and passwords replaced by `***`.
+
+Ctrl+K searches records as well as commands. Live search waits about 150ms, then runs a full-text search on each master entity and drops the result if the query changed. Mock search is local. Choosing a hit selects that record in a table of its entity and focuses a detail linked to it.
+
+`workspace.json` version 2 stores a tab per workspace. Templates (Browse, Search & inspect, Data quality) are built from the loaded model. A version 1 file opens as one Browse tab.
 
 ## Workspace file
 
-`workspace.json` in the working directory. Versioned JSON: theme, layout tree, view specs, focus, zoom, selections. A saved file that names entities the current model does not have is stripped on load.
+`workspace.json` in the working directory. Version 2 stores theme plus one tab per workspace (layout, views, focus, zoom, selections). A version 1 file is read as a single Browse tab. A saved file that names entities the current model does not have is stripped on load. The accent is Fiwe Mint `#47FF9A` on the dark theme. Light theme text uses a darker mint so it stays readable on white.
 
 ## Open questions
 

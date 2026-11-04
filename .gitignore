@@ -1,5 +1,6 @@
 /target
 workspace.json
 .env
+.idmc-cache
 **/*.rs.bk
 .DS_Store

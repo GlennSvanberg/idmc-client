@@ -8,6 +8,6 @@ description = "Backend trait and mock data for the IDMC client."
 
 [dependencies]
 idmc-model.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "hickory-dns"] }
 serde_json.workspace = true
 thiserror.workspace = true

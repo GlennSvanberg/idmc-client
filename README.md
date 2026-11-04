@@ -17,7 +17,7 @@ That loads `mock/idmc-export/person`, sample code-list values from `mock/referen
 ```bash
 cargo run -p idmc-client -- --export mock/idmc-export/item
 cargo run -p idmc-client -- --model mock/sample/model.json --data mock/sample/data.json
-cargo run -p idmc-client -- --help
+cargo run -p idmc-client --release -- --help
 ```
 
 Copy `.env.example` to `.env` for a live org. `.env` is gitignored. The process environment wins over the file, and nothing in the client prints the password or the session id.
@@ -30,11 +30,15 @@ cargo run -p idmc-client -- --backend live --debug-dump /tmp/idmc-debug.log
 
 `--backend mock` is the default, including when `.env` contains credentials but `IDMC_BACKEND` is unset or `mock`. `--check-login` logs in with API v3 (`POST {login}/saas/public/core/v3/login`) and falls back to v2 (`POST {login}/ma/api/v2/user/login`), then runs one search. Exit status is 0 when that works.
 
-Live data uses `IDS-SESSION-ID`. The MDM host is the login `baseApiUrl` (v3) or `serverUrl` (v2) with `/saas` removed and `-mdm` added to the pod label (`https://use4.dm-us.informaticacloud.com/saas` becomes `https://use4-mdm.dm-us.informaticacloud.com`). Records come from `POST /search/public/api/v1/search` (`search` is `*`; the first page is loaded before the window opens, the rest in the background). A master record that is missing nested field groups is read with `GET /business-entity/public/api/v1/entity/{businessEntity}/{businessId}`. A 401 logs in again once. A 429 waits for `Retry-After` or backs off, up to 30 seconds. The model is still the export package. There is no general metadata API. Request and response shapes are the pages under `docs/idmc-api/`.
+Live data uses `IDS-SESSION-ID`. HTTP calls time out after 15 seconds to connect and 60 seconds to read. The MDM host is the login `baseApiUrl` (v3) or `serverUrl` (v2) with `/saas` removed and `-mdm` added to the pod label (`https://usw1.dmp-us.informaticacloud.com/saas` becomes `https://usw1-mdm.dmp-us.informaticacloud.com`). A master table shows the search hit count immediately and fetches 500-row windows as you scroll, sorted by the server, with at most four requests in flight. A previous window is read from the local cache (`IDMC_CACHE`, else the user cache directory) and refreshed in the background. `--check-login` prints each step as it happens. A master record that is missing nested field groups is read with `GET /business-entity/public/api/v1/entity/{businessEntity}/{businessId}`. A 401 logs in again once. A 429 waits for `Retry-After` or backs off, up to 30 seconds. The model is still the export package. There is no general metadata API. Request and response shapes are the pages under `docs/idmc-api/`. How the windowed list relates to an Egress snapshot is `docs/performance.md`.
+
+`cargo run -p idmc-client --release` is the build to use against a real org. Debug builds compile dependencies at `opt-level = 2` so the UI is usable, and still slower than release.
+
+The tab bar holds several workspaces. `+` or Ctrl+K “New workspace from template” adds Browse, Search & inspect, or Data quality, built from the entities in the loaded model. Rename, duplicate, and close are in the same palette. Typing a record name in Ctrl+K searches every master entity (the Search API when live, local records when mock) and opens the match in a detail view.
 
 `--values FILE` overlays code-list rows onto Reference 360 names. The Person launch does this automatically. Point `--export` at the Item package without `--values` and the Item lookups stay empty, because that overlay file names Person code lists. Live lookup objects `{Code, Name}` supply a display name when the overlay does not have that code.
 
-The workspace is saved to `workspace.json` in the current directory (`--workspace` overrides the path). `Ctrl+S` writes it. Structural changes (close, dock, theme, reset) save as well.
+Workspaces are saved to `workspace.json` in the current directory (`--workspace` overrides the path). `Ctrl+S` writes them. Structural changes (close, dock, theme, reset, workspace tabs) save as well. A file written by an older build, with one layout and no tabs, opens as a single Browse workspace.
 
 ## Keyboard
 
