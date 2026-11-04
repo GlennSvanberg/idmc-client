@@ -45,7 +45,7 @@ Ctrl+K searches records as well as commands. Live search waits about 150ms, then
 
 ## Workspace file
 
-`workspace.json` in the working directory. Version 2 stores theme plus one tab per workspace (layout, views, focus, zoom, selections). A version 1 file is read as a single Browse tab. A saved file that names entities the current model does not have is stripped on load. The accent is Fiwe Mint `#47FF9A` on the dark theme. Light theme text uses a darker mint so it stays readable on white.
+`workspace.json` in the working directory. Version 2 stores theme plus one tab per workspace (layout, views, focus, zoom, selections). A version 1 file is read as a single Browse tab. A saved file that names entities the current model does not have is stripped on load. The accent is Fiwe Mint `#47FF9A` on the dark theme. Light theme text uses a darker mint so it stays readable on white. The header draws `assets/logo/mark.svg` in color. The window icon on Windows is `assets/logo/idmc-client.ico` (16, 32, 48, and 256, packed from the PNGs) linked as resource 1, which is the icon GPUI loads for the window class.
 
 ## Open questions
 

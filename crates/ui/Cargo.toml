@@ -21,3 +21,6 @@ idmc-layout.workspace = true
 gpui = "=0.2.2"
 serde.workspace = true
 serde_json.workspace = true
+
+[build-dependencies]
+embed-resource = "=3.0.12"

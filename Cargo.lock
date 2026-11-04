@@ -2807,6 +2807,7 @@ dependencies = [
 name = "idmc-client"
 version = "0.1.0"
 dependencies = [
+ "embed-resource",
  "gpui",
  "idmc-backend",
  "idmc-layout",

@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use gpui::{
-    actions, div, px, prelude::*, rgb, size, AnyElement, App, Application, Bounds, ClickEvent,
-    Context, FocusHandle, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, Render,
+    actions, div, img, px, prelude::*, rgb, size, AnyElement, App, Application, Bounds, ClickEvent,
+    Context, FocusHandle, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Render,
     SharedString, Timer, Window, WindowBounds, WindowOptions,
 };
 use idmc_backend::Backend;
@@ -650,6 +650,7 @@ impl Root {
             .bg(rgb(theme.panel))
             .border_b_1()
             .border_color(rgb(theme.border))
+            .child(img("logo/mark.svg").w(px(18.)).h(px(20.)).object_fit(ObjectFit::Contain))
             .child(div().text_size(px(13.)).child("IDMC Client"))
             .child(
                 div()

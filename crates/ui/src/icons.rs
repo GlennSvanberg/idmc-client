@@ -14,6 +14,9 @@ pub struct IconAssets;
 
 impl AssetSource for IconAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(bytes) = logo_bytes(path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
         Ok(svg_for(path).map(|text| Cow::Borrowed(text.as_bytes())))
     }
 
@@ -57,6 +60,20 @@ impl Render for Tip {
             .text_size(px(12.))
             .child(self.text.clone())
     }
+}
+
+fn logo_bytes(path: &str) -> Option<&'static [u8]> {
+    Some(match path {
+        "logo/mark.svg" => include_bytes!("../../../assets/logo/mark.svg"),
+        "logo/icon.svg" => include_bytes!("../../../assets/logo/icon.svg"),
+        "logo/icon-16.png" => include_bytes!("../../../assets/logo/icon-16.png"),
+        "logo/icon-32.png" => include_bytes!("../../../assets/logo/icon-32.png"),
+        "logo/icon-48.png" => include_bytes!("../../../assets/logo/icon-48.png"),
+        "logo/icon-256.png" => include_bytes!("../../../assets/logo/icon-256.png"),
+        "logo/icon-512.png" => include_bytes!("../../../assets/logo/icon-512.png"),
+        "logo/idmc-client.ico" => include_bytes!("../../../assets/logo/idmc-client.ico"),
+        _ => return None,
+    })
 }
 
 fn svg_for(path: &str) -> Option<&'static str> {
@@ -112,5 +129,52 @@ mod tests {
             assert!(text.contains("viewBox"), "{name}");
         }
         assert!(IconAssets.load("icons/missing.svg").unwrap().is_none());
+    }
+
+    #[test]
+    fn logo_assets_and_windows_icon_match_the_pngs() {
+        let mark = IconAssets.load("logo/mark.svg").unwrap().unwrap();
+        let text = std::str::from_utf8(&mark).unwrap();
+        assert!(text.contains("#47FF9A"), "header mark keeps the mint fill");
+        let icon_bytes = IconAssets.load("logo/icon.svg").unwrap().unwrap();
+        let icon = std::str::from_utf8(&icon_bytes).unwrap();
+        assert!(icon.contains("<svg"));
+        for (name, size) in [("logo/icon-16.png", 16u32), ("logo/icon-32.png", 32), ("logo/icon-48.png", 48), ("logo/icon-256.png", 256), ("logo/icon-512.png", 512)] {
+            let png = IconAssets.load(name).unwrap().unwrap();
+            assert_eq!(png_size(&png), (size, size), "{name}");
+        }
+        let ico = IconAssets.load("logo/idmc-client.ico").unwrap().unwrap();
+        assert_eq!(ico_sizes(&ico), vec![16, 32, 48, 256]);
+    }
+
+    fn png_size(bytes: &[u8]) -> (u32, u32) {
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&bytes[12..16], b"IHDR");
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        (width, height)
+    }
+
+    fn ico_sizes(bytes: &[u8]) -> Vec<u32> {
+        assert!(bytes.len() >= 6);
+        let reserved = u16::from_le_bytes(bytes[0..2].try_into().unwrap());
+        let kind = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
+        let count = u16::from_le_bytes(bytes[4..6].try_into().unwrap()) as usize;
+        assert_eq!(reserved, 0);
+        assert_eq!(kind, 1);
+        let mut sizes = Vec::with_capacity(count);
+        for index in 0..count {
+            let entry = 6 + index * 16;
+            let width = bytes[entry];
+            let height = bytes[entry + 1];
+            let size = if width == 0 { 256 } else { width as u32 };
+            assert_eq!(height, width);
+            let length = u32::from_le_bytes(bytes[entry + 8..entry + 12].try_into().unwrap()) as usize;
+            let offset = u32::from_le_bytes(bytes[entry + 12..entry + 16].try_into().unwrap()) as usize;
+            let image = &bytes[offset..offset + length];
+            assert_eq!(png_size(image), (size, size));
+            sizes.push(size);
+        }
+        sizes
     }
 }
