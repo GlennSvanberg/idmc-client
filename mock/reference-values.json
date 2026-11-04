@@ -1,0 +1,51 @@
+{
+  "note": "Sample code rows for the Customer 360 Person demo. The Business 360 export identifies Reference 360 code lists but does not include their value rows.",
+  "lookups": {
+    "Gender": [
+      { "id": "F", "label": "Female" },
+      { "id": "M", "label": "Male" },
+      { "id": "X", "label": "Unspecified" }
+    ],
+    "MaritalStatus": [
+      { "id": "S", "label": "Single" },
+      { "id": "M", "label": "Married" },
+      { "id": "D", "label": "Divorced" }
+    ],
+    "PrefixName": [
+      { "id": "MS", "label": "Ms" },
+      { "id": "MR", "label": "Mr" },
+      { "id": "DR", "label": "Dr" }
+    ],
+    "Country": [
+      { "id": "SE", "label": "Sweden" },
+      { "id": "NO", "label": "Norway" },
+      { "id": "DE", "label": "Germany" },
+      { "id": "US", "label": "United States" }
+    ],
+    "State": [
+      { "id": "SE-AB", "label": "Stockholm", "parent": "SE" },
+      { "id": "US-CA", "label": "California", "parent": "US" }
+    ],
+    "AddressType": [
+      { "id": "HOME", "label": "Home" },
+      { "id": "WORK", "label": "Work" }
+    ],
+    "AddressUsageType": [
+      { "id": "PRIMARY", "label": "Primary" },
+      { "id": "ALT", "label": "Alternate" }
+    ],
+    "PhoneType": [
+      { "id": "MOBILE", "label": "Mobile" },
+      { "id": "HOME", "label": "Home" },
+      { "id": "WORK", "label": "Work" }
+    ],
+    "PhoneUsageType": [
+      { "id": "PERSONAL", "label": "Personal" },
+      { "id": "BUSINESS", "label": "Business" }
+    ],
+    "ElectronicAddressUsageType": [
+      { "id": "PERSONAL", "label": "Personal" },
+      { "id": "WORK", "label": "Work" }
+    ]
+  }
+}

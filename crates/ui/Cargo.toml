@@ -1,0 +1,23 @@
+[package]
+name = "idmc-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "GPUI desktop client for Informatica IDMC."
+
+[lib]
+name = "idmc_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "idmc-client"
+path = "src/main.rs"
+
+[dependencies]
+idmc-model.workspace = true
+idmc-backend.workspace = true
+idmc-layout.workspace = true
+gpui = "=0.2.2"
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,228 @@
+{
+  "records": [
+    {
+      "entity": "c360.person",
+      "id": "p-anna",
+      "values": {
+        "firstName": "Anna",
+        "lastName": "Lindström",
+        "fullName": "Anna Lindström",
+        "prefixName": "MS",
+        "gender": "F",
+        "maritalStatus": "M",
+        "birthDate": "1984-03-12",
+        "title": "Product owner",
+        "birthPlace": "Uppsala",
+        "PostalAddress": [
+          {
+            "defaultIndicator": true,
+            "addressType": "HOME",
+            "usageType": "PRIMARY",
+            "addressLine1": "Kungsgatan 12",
+            "city": "Stockholm",
+            "postalCode": "111 43",
+            "country": "SE",
+            "state": "SE-AB"
+          },
+          {
+            "addressType": "WORK",
+            "usageType": "ALT",
+            "addressLine1": "Sveavägen 44",
+            "addressLine2": "Floor 5",
+            "city": "Stockholm",
+            "postalCode": "111 34",
+            "country": "SE"
+          }
+        ],
+        "Phone": [
+          {
+            "defaultIndicator": true,
+            "phoneType": "MOBILE",
+            "phoneUsageType": "PERSONAL",
+            "phoneNumber": "+46 70 555 0101"
+          },
+          {
+            "phoneType": "WORK",
+            "phoneUsageType": "BUSINESS",
+            "phoneNumber": "+46 8 555 0190"
+          }
+        ],
+        "ElectronicAddress": [
+          {
+            "defaultIndicator": true,
+            "usageType": "PERSONAL",
+            "electronicAddress": "anna.lindstrom@example.com"
+          }
+        ]
+      }
+    },
+    {
+      "entity": "c360.person",
+      "id": "p-erik",
+      "values": {
+        "firstName": "Erik",
+        "lastName": "Nilsen",
+        "fullName": "Erik Nilsen",
+        "gender": "M",
+        "maritalStatus": "S",
+        "birthDate": "1996-01-30",
+        "title": "Analyst",
+        "PostalAddress": [
+          {
+            "defaultIndicator": true,
+            "addressType": "HOME",
+            "usageType": "PRIMARY",
+            "addressLine1": "Karl Johans gate 8",
+            "city": "Oslo",
+            "postalCode": "0154",
+            "country": "NO"
+          }
+        ],
+        "Phone": [
+          {
+            "defaultIndicator": true,
+            "phoneType": "MOBILE",
+            "phoneUsageType": "PERSONAL",
+            "phoneNumber": "+47 900 11 223"
+          }
+        ]
+      }
+    },
+    {
+      "entity": "c360.person",
+      "id": "p-johan",
+      "values": {
+        "firstName": "Johan",
+        "lastName": "Berg",
+        "fullName": "Johan Berg",
+        "prefixName": "MR",
+        "gender": "M",
+        "maritalStatus": "S",
+        "birthDate": "1991-11-02",
+        "title": "Engineer",
+        "PostalAddress": [
+          {
+            "defaultIndicator": true,
+            "addressType": "HOME",
+            "usageType": "PRIMARY",
+            "addressLine1": "Avenyn 3",
+            "city": "Göteborg",
+            "postalCode": "411 36",
+            "country": "SE"
+          }
+        ],
+        "Phone": [
+          {
+            "defaultIndicator": true,
+            "phoneType": "MOBILE",
+            "phoneUsageType": "PERSONAL",
+            "phoneNumber": "+46 73 555 0144"
+          }
+        ],
+        "ElectronicAddress": [
+          {
+            "defaultIndicator": true,
+            "usageType": "PERSONAL",
+            "electronicAddress": "johan.berg@example.com"
+          }
+        ]
+      }
+    },
+    {
+      "entity": "c360.person",
+      "id": "p-maria",
+      "values": {
+        "firstName": "Maria",
+        "lastName": "Keller",
+        "fullName": "Maria Keller",
+        "gender": "F",
+        "maritalStatus": "M",
+        "birthDate": "1978-07-19",
+        "title": "Buyer",
+        "PostalAddress": [
+          {
+            "defaultIndicator": true,
+            "addressType": "HOME",
+            "usageType": "PRIMARY",
+            "addressLine1": "Speicherstadt 9",
+            "city": "Hamburg",
+            "postalCode": "20457",
+            "country": "DE"
+          },
+          {
+            "addressType": "WORK",
+            "usageType": "ALT",
+            "addressLine1": "Mönckebergstraße 7",
+            "city": "Hamburg",
+            "postalCode": "20095",
+            "country": "DE"
+          }
+        ],
+        "Phone": [
+          {
+            "defaultIndicator": true,
+            "phoneType": "MOBILE",
+            "phoneUsageType": "BUSINESS",
+            "phoneNumber": "+49 170 555 0188"
+          }
+        ],
+        "ElectronicAddress": [
+          {
+            "defaultIndicator": true,
+            "usageType": "WORK",
+            "electronicAddress": "maria.keller@example.com"
+          },
+          {
+            "usageType": "PERSONAL",
+            "electronicAddress": "mkeller@example.net"
+          }
+        ]
+      }
+    },
+    {
+      "entity": "c360.person",
+      "id": "p-sofia",
+      "values": {
+        "firstName": "Sofia",
+        "lastName": "Chen",
+        "fullName": "Sofia Chen",
+        "gender": "F",
+        "maritalStatus": "S",
+        "birthDate": "1990-09-08",
+        "title": "Designer",
+        "PostalAddress": [
+          {
+            "defaultIndicator": true,
+            "addressType": "HOME",
+            "usageType": "PRIMARY",
+            "addressLine1": "500 Market Street",
+            "city": "San Francisco",
+            "postalCode": "94105",
+            "country": "US",
+            "state": "US-CA"
+          }
+        ],
+        "Phone": [
+          {
+            "defaultIndicator": true,
+            "phoneType": "MOBILE",
+            "phoneUsageType": "PERSONAL",
+            "phoneNumber": "+1 415 555 0177"
+          },
+          {
+            "phoneType": "HOME",
+            "phoneUsageType": "PERSONAL",
+            "phoneNumber": "+1 415 555 0199"
+          }
+        ],
+        "ElectronicAddress": [
+          {
+            "defaultIndicator": true,
+            "usageType": "PERSONAL",
+            "electronicAddress": "sofia.chen@example.com"
+          }
+        ]
+      }
+    }
+  ]
+}

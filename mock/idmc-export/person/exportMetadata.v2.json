@@ -1,0 +1,1217 @@
+{
+  "name" : "Person-1793799552995",
+  "sourceOrgId" : "7rWGGHjFueMcJLplwB1N8l",
+  "sourceOrgName" : "Fiwe Systems and Consulting AB",
+  "providerLevelValidator" : {
+    "MDM" : [ {
+      "solutionsToValidate" : {
+        "c360" : {
+          "version" : "202410.01"
+        },
+        "r360" : {
+          "version" : "default"
+        }
+      },
+      "additionalSolutionsInSource" : {
+        "b360" : {
+          "version" : "202410.01"
+        },
+        "p360" : {
+          "version" : "202208.01"
+        },
+        "mde" : {
+          "version" : "202211.01"
+        },
+        "s360" : {
+          "version" : "202211.01"
+        }
+      },
+      "vaderMigrationStatus" : "NOT_STARTED",
+      "referenceDataAssets" : null,
+      "populationManifest" : null
+    } ]
+  },
+  "exportedObjects" : [ {
+    "objectGuid" : "79Zb6cUmMHKkVD9oX9Y4IR",
+    "objectName" : "SegmentValue",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c987e5a7ba60bdb1b4761"
+      },
+      "objectRefs" : [ "6ggYTH3pc3ykF7ERVla7UM" ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "6ggYTH3pc3ykF7ERVla7UM",
+    "objectName" : "SegmentType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c985eae466403ae69eb60"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "azSLwo7WhKKfDQEaepMmuC",
+    "objectName" : "TaxPayerType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c988d5a7ba60bdb1b4937"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "fX4liz7PbCXeVadY04VpwT",
+    "objectName" : "TimePeriodType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98705a7ba60bdb1b4488"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "7buFMIGbqsik1kvSWYr2uZ",
+    "objectName" : "DocumentType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98b3ae466403ae69ff7f"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "hOwpoLa4s0DcMvYujT1m2k",
+    "objectName" : "LoyaltyAccountStatus",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98c4ae466403ae6a0ae4"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "9NL52cztrwBkIs8OxjMRQF",
+    "objectName" : "PhoneType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98e0ae466403ae6a1d03"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "dIMJjMyjYaIdKqYQuRWQ2C",
+    "objectName" : "ElectronicAddressUsageType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98a45a7ba60bdb1b5156"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "5E8hbUVD3BBcE0dw0uXxc0",
+    "objectName" : "FinanceInfoType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98955a7ba60bdb1b4a91"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "3aaphM7Yvk5iIfYKWyYkc1",
+    "objectName" : "PrefixName",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c986a5a7ba60bdb1b4349"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "1iqpR0AO1tfkqx3eMPYscZ",
+    "objectName" : "Reference360",
+    "objectType" : "Project",
+    "path" : "/Explore",
+    "providerName" : null,
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 0,
+        "minor" : 0
+      },
+      "repoInfo" : null,
+      "objectRefs" : [ ],
+      "contextAttributes" : [ ],
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "55V2Vkr7epLckBwBXIOvay",
+    "objectName" : "ElectronicAddressStatus",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98745a7ba60bdb1b455d"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "5evDeTy5NLXkIZ75TdXrM8",
+    "objectName" : "QualificationStatus",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98c1ae466403ae6a09ef"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "gyTvfTvdxG4lPAF0VegHe6",
+    "objectName" : "InsuranceType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9917ae466403ae6a2adc"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "2seCS3CLAeWf5UWBGDcKm2",
+    "objectName" : "AlternateIdType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9887ae466403ae69ee29"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "5KdwnmAd8wYhCQfJIdj1CX",
+    "objectName" : "Country",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98d75a7ba60bdb1b5ae6"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "8RPkcPdHBZGhdm5P3ay5Cg",
+    "objectName" : "FinancialUnit",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9941ae466403ae6a36b6"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "d7q0NmysPUNdEokmJJVbql",
+    "objectName" : "Address_Verifier_OOTB",
+    "objectType" : "VERIFIER",
+    "path" : "/Explore/Business360",
+    "providerName" : null,
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 0
+      },
+      "repoInfo" : {
+        "repoHandle" : "d7q0NmysPUNdEokmJJVbql"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : [ ],
+      "additionalInfo" : {
+        "description" : "Verifies the address.",
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "0cQ9nppkTKHbpO8yU435oY",
+    "objectName" : "PersonStatusType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c990fae466403ae6a26bd"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "bl3eOz1tKOqfeh8ilMJGyN",
+    "objectName" : "MaritalStatus",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98d1ae466403ae6a127f"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "eAlgXwlR7w9ktrNqUIMNUu",
+    "objectName" : "RedemptionPreferences",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9906ae466403ae6a23bd"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "5W1aZmaXTaGi4EN6zYXBOT",
+    "objectName" : "Customer360",
+    "objectType" : "Project",
+    "path" : "/Explore",
+    "providerName" : null,
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 0,
+        "minor" : 0
+      },
+      "repoInfo" : null,
+      "objectRefs" : [ ],
+      "contextAttributes" : [ ],
+      "additionalInfo" : {
+        "description" : "",
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "7rBolXC10aId97dc3Esbke",
+    "objectName" : "EmploymentType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9923ae466403ae6a2c9e"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "jIJVHrUmQMdbdYJdh6S3C3",
+    "objectName" : "LifestyleType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9935ae466403ae6a3557"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "3kufAiPbTyji7jExw6i6c0",
+    "objectName" : "PhoneStatus",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98a15a7ba60bdb1b4ea5"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "8TFhU1p6zpQe6QT1FcWIy5",
+    "objectName" : "TaxNumberType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98eaae466403ae6a2125"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "1anqEUhu8oleYHTXxtSzSo",
+    "objectName" : "AddressStatus",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c993eae466403ae6a366e"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "hJKKItskBscduAlHrMHI6r",
+    "objectName" : "IssuingAuthority",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9858ae466403ae69eaeb"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "lHntJfZhuczfunMPolrBO8",
+    "objectName" : "SpecialityType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c99205a7ba60bdb1b7ade"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "0yUIL61qg8dd4xGX9Sw40d",
+    "objectName" : "AddressEnrichedIndicator",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98b05a7ba60bdb1b531a"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "6M0loBTLmJEkUIPm1o5w2f",
+    "objectName" : "QualificationType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98615a7ba60bdb1b4227"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "4xUBqz79RQpcAqQ9bFZJSK",
+    "objectName" : "LoyaltyAccountType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98e45a7ba60bdb1b5be9"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "cQM22Y2Eg2MefOo6YvGDmu",
+    "objectName" : "TaxAuthority",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98d45a7ba60bdb1b5a88"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "lP4cd6wEPivkx0XOAcJlEh",
+    "objectName" : "PersonStatusValue",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98fbae466403ae6a2292"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "5wdGhJcxRrfgqlMFIkl3IQ",
+    "objectName" : "DemographicValue",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c99155a7ba60bdb1b7038"
+      },
+      "objectRefs" : [ "6blPD5qwYzoipgsFFcMAkM" ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "lcCrP0xSfMIeXilG7kHwSL",
+    "objectName" : "PhoneUsageType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c984c5a7ba60bdb1b3fbc"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "4qqSWZ9CQUhjobNOPnUcEo",
+    "objectName" : "Gender",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9904ae466403ae6a2386"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "6blPD5qwYzoipgsFFcMAkM",
+    "objectName" : "DemographicType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c99125a7ba60bdb1b6d18"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "9Ab6QdUFzmEkJSdDXrZr2t",
+    "objectName" : "SocialHandleType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98525a7ba60bdb1b4061"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "1jhMbd2t8qbkiZLbF5mA2x",
+    "objectName" : "DUNS SSN Validation",
+    "objectType" : "RULE_SPECIFICATION",
+    "path" : "/Explore/Customer360",
+    "providerName" : null,
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 0
+      },
+      "repoInfo" : {
+        "repoHandle" : "1jhMbd2t8qbkiZLbF5mA2x"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : [ ],
+      "additionalInfo" : {
+        "description" : "Validates DUNS & SSN Number",
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "6rZpbFuHgeYhBEPOdJyqit",
+    "objectName" : "State",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98daae466403ae6a18e4"
+      },
+      "objectRefs" : [ "5KdwnmAd8wYhCQfJIdj1CX" ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "6GvzoNf1sCifj2dvPvtNo8",
+    "objectName" : "InsuranceSubType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98aaae466403ae69fa30"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "4JyVPrLJCqcegQNVbif4aI",
+    "objectName" : "IdentifierStatus",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c99265a7ba60bdb1b7d9a"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "8QjoC7UsX95dY99KwRLhA1",
+    "objectName" : "InsuranceStatus",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9929ae466403ae6a2d58"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "21UAvFhK7KYgm6lLfsmAIz",
+    "objectName" : "AlternateNameType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c989bae466403ae69f5bd"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "jUF0UGtfoAhfvQKu72loWv",
+    "objectName" : "SuffixName",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c98c85a7ba60bdb1b59e9"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "7l3FtsTuqd8cVW9WKItwYV",
+    "objectName" : "AddressUsageType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9848ae466403ae69e9a7"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "714SUuUg3W2dayxslbO48z",
+    "objectName" : "AddressType",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c987a5a7ba60bdb1b46bd"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "8CLUV3eVNTgdNOKY2uFxGY",
+    "objectName" : "Person",
+    "objectType" : "MDM_BUSINESS_ENTITY",
+    "path" : "/Explore/Customer360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "c360.person"
+      },
+      "objectRefs" : [ "79Zb6cUmMHKkVD9oX9Y4IR", "6ggYTH3pc3ykF7ERVla7UM", "fX4liz7PbCXeVadY04VpwT", "azSLwo7WhKKfDQEaepMmuC", "7buFMIGbqsik1kvSWYr2uZ", "hOwpoLa4s0DcMvYujT1m2k", "9NL52cztrwBkIs8OxjMRQF", "dIMJjMyjYaIdKqYQuRWQ2C", "5E8hbUVD3BBcE0dw0uXxc0", "3aaphM7Yvk5iIfYKWyYkc1", "55V2Vkr7epLckBwBXIOvay", "5evDeTy5NLXkIZ75TdXrM8", "gyTvfTvdxG4lPAF0VegHe6", "2seCS3CLAeWf5UWBGDcKm2", "5KdwnmAd8wYhCQfJIdj1CX", "8RPkcPdHBZGhdm5P3ay5Cg", "d7q0NmysPUNdEokmJJVbql", "0cQ9nppkTKHbpO8yU435oY", "bl3eOz1tKOqfeh8ilMJGyN", "eAlgXwlR7w9ktrNqUIMNUu", "7rBolXC10aId97dc3Esbke", "jIJVHrUmQMdbdYJdh6S3C3", "3kufAiPbTyji7jExw6i6c0", "8TFhU1p6zpQe6QT1FcWIy5", "1anqEUhu8oleYHTXxtSzSo", "hJKKItskBscduAlHrMHI6r", "lHntJfZhuczfunMPolrBO8", "6M0loBTLmJEkUIPm1o5w2f", "0yUIL61qg8dd4xGX9Sw40d", "4xUBqz79RQpcAqQ9bFZJSK", "lP4cd6wEPivkx0XOAcJlEh", "cQM22Y2Eg2MefOo6YvGDmu", "5wdGhJcxRrfgqlMFIkl3IQ", "lcCrP0xSfMIeXilG7kHwSL", "4qqSWZ9CQUhjobNOPnUcEo", "6blPD5qwYzoipgsFFcMAkM", "9Ab6QdUFzmEkJSdDXrZr2t", "1jhMbd2t8qbkiZLbF5mA2x", "6rZpbFuHgeYhBEPOdJyqit", "6GvzoNf1sCifj2dvPvtNo8", "4JyVPrLJCqcegQNVbif4aI", "8QjoC7UsX95dY99KwRLhA1", "21UAvFhK7KYgm6lLfsmAIz", "jUF0UGtfoAhfvQKu72loWv", "7l3FtsTuqd8cVW9WKItwYV", "714SUuUg3W2dayxslbO48z", "3Ip3WKKrsJKi0x2SHPpW04", "20wk8YVAbScipPXfcjARUh", "20S97RpFbsdf8lTnRHtSS8", "i8rhkTH8MYZbuj9TDSqaSs" ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : "",
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "3Ip3WKKrsJKi0x2SHPpW04",
+    "objectName" : "EmploymentStatus",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c984f5a7ba60bdb1b4026"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "20wk8YVAbScipPXfcjARUh",
+    "objectName" : "Informatica Customer 360",
+    "objectType" : "MDM_SRC_SYSTEM",
+    "path" : "/Explore/Customer360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "c360.default.system"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "20S97RpFbsdf8lTnRHtSS8",
+    "objectName" : "Currency",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c9932ae466403ae6a33ea"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "i8rhkTH8MYZbuj9TDSqaSs",
+    "objectName" : "FinanceReliability",
+    "objectType" : "MDM_REFERENCE_ENTITY",
+    "path" : "/Explore/Reference360",
+    "providerName" : "MDM",
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 1,
+        "minor" : 1
+      },
+      "repoInfo" : {
+        "repoHandle" : "rdm.value.be.636c99005a7ba60bdb1b69ab"
+      },
+      "objectRefs" : [ ],
+      "contextAttributes" : null,
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  }, {
+    "objectGuid" : "9Bgs3G1cD8ud7dYxdWBaMD",
+    "objectName" : "Business360",
+    "objectType" : "Project",
+    "path" : "/Explore",
+    "providerName" : null,
+    "metadata" : {
+      "modelVersion" : {
+        "major" : 0,
+        "minor" : 0
+      },
+      "repoInfo" : null,
+      "objectRefs" : [ ],
+      "contextAttributes" : [ ],
+      "additionalInfo" : {
+        "description" : null,
+        "contentType" : "Binary",
+        "documentState" : "COMPLETE"
+      }
+    }
+  } ]
+}

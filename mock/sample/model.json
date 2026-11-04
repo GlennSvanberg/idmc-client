@@ -1,0 +1,109 @@
+{
+  "name": "Sample catalog",
+  "entities": [
+    {
+      "id": "Category",
+      "name": "Category",
+      "label": "Category",
+      "labelPlural": "Categories",
+      "labelField": "name",
+      "labelFields": ["name"],
+      "hierarchy": { "parentField": "parent", "label": "Category hierarchy" },
+      "fields": [
+        { "id": "name", "name": "name", "label": "Name", "type": "string", "mandatory": true, "defaultColumn": true },
+        { "id": "parent", "name": "parent", "label": "Parent", "type": "reference", "targetEntity": "Category" }
+      ]
+    },
+    {
+      "id": "Product",
+      "name": "Product",
+      "label": "Product",
+      "labelPlural": "Products",
+      "labelFields": ["name"],
+      "fields": [
+        { "id": "sku", "name": "sku", "label": "SKU", "type": "string", "mandatory": true, "defaultColumn": true },
+        { "id": "name", "name": "name", "label": "Name", "type": "string", "mandatory": true, "defaultColumn": true },
+        { "id": "status", "name": "status", "label": "Status", "type": "lookup", "lookup": "ProductStatus", "defaultColumn": true },
+        { "id": "category", "name": "category", "label": "Category", "type": "reference", "targetEntity": "Category", "defaultColumn": true }
+      ]
+    },
+    {
+      "id": "Article",
+      "name": "Article",
+      "label": "Article",
+      "labelPlural": "Articles",
+      "labelFields": ["name"],
+      "fields": [
+        { "id": "articleNo", "name": "articleNo", "label": "Article no.", "type": "string", "mandatory": true, "defaultColumn": true },
+        { "id": "name", "name": "name", "label": "Name", "type": "string", "mandatory": true, "defaultColumn": true },
+        { "id": "product", "name": "product", "label": "Product", "type": "reference", "targetEntity": "Product", "defaultColumn": true },
+        { "id": "color", "name": "color", "label": "Color", "type": "lookup", "lookup": "Color", "defaultColumn": true }
+      ]
+    }
+  ],
+  "lookups": [
+    {
+      "id": "ProductStatus",
+      "label": "Product status",
+      "values": [
+        { "id": "draft", "label": "Draft" },
+        { "id": "active", "label": "Active" }
+      ]
+    },
+    {
+      "id": "Color",
+      "label": "Color",
+      "values": [
+        { "id": "black", "label": "Black" },
+        { "id": "white", "label": "White" }
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "id": "category_children",
+      "label": "Child categories",
+      "from": "Category",
+      "to": "Category",
+      "cardinality": "one_to_many",
+      "field": "parent",
+      "fieldOn": "to"
+    },
+    {
+      "id": "category_products",
+      "label": "Products in category",
+      "from": "Category",
+      "to": "Product",
+      "cardinality": "one_to_many",
+      "field": "category",
+      "fieldOn": "to"
+    },
+    {
+      "id": "product_category",
+      "label": "Category of product",
+      "from": "Product",
+      "to": "Category",
+      "cardinality": "many_to_one",
+      "field": "category",
+      "fieldOn": "from"
+    },
+    {
+      "id": "product_articles",
+      "label": "Articles of product",
+      "from": "Product",
+      "to": "Article",
+      "cardinality": "one_to_many",
+      "field": "product",
+      "fieldOn": "to"
+    },
+    {
+      "id": "article_product",
+      "label": "Product of article",
+      "from": "Article",
+      "to": "Product",
+      "cardinality": "many_to_one",
+      "field": "product",
+      "fieldOn": "from"
+    }
+  ]
+}

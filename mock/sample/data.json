@@ -1,0 +1,27 @@
+{
+  "records": [
+    { "entity": "Category", "id": "cat-electronics", "values": { "name": "Electronics" } },
+    { "entity": "Category", "id": "cat-phones", "values": { "name": "Phones", "parent": "cat-electronics" } },
+    { "entity": "Category", "id": "cat-home", "values": { "name": "Home" } },
+    {
+      "entity": "Product",
+      "id": "prd-nx",
+      "values": { "sku": "NX-100", "name": "Nordic Phone X", "status": "active", "category": "cat-phones" }
+    },
+    {
+      "entity": "Product",
+      "id": "prd-kettle",
+      "values": { "sku": "KT-17", "name": "Kettle Steel", "status": "draft", "category": "cat-home" }
+    },
+    {
+      "entity": "Article",
+      "id": "art-nx-b",
+      "values": { "articleNo": "A-NX-B", "name": "Nordic Phone X / Black", "product": "prd-nx", "color": "black" }
+    },
+    {
+      "entity": "Article",
+      "id": "art-nx-w",
+      "values": { "articleNo": "A-NX-W", "name": "Nordic Phone X / White", "product": "prd-nx", "color": "white" }
+    }
+  ]
+}
