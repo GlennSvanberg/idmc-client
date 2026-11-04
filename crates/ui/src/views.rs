@@ -96,6 +96,33 @@ impl Root {
                 this.session.file.focus = Some(menu_id.clone());
                 this.exec("view.link", cx);
             }))
+            .when(matches!(kind, Some(ViewKind::Table | ViewKind::Detail)), |el| {
+                let fresh = id.to_string();
+                let remove = id.to_string();
+                let save_id = id.to_string();
+                let revert_id = id.to_string();
+                let mut row = el
+                    .child(self.header_button(&format!("new-{id}"), "plus", "New record", theme, cx, move |this, cx| {
+                        this.session.file.focus = Some(fresh.clone());
+                        this.exec("record.new", cx);
+                    }))
+                    .child(self.header_button(&format!("del-{id}"), "trash", "Delete", theme, cx, move |this, cx| {
+                        this.session.file.focus = Some(remove.clone());
+                        this.exec("record.delete", cx);
+                    }));
+                if self.session.dirty_records() {
+                    row = row
+                        .child(self.header_button(&format!("save-{id}"), "save", "Save", theme, cx, move |this, cx| {
+                            this.session.file.focus = Some(save_id.clone());
+                            this.exec("record.save", cx);
+                        }))
+                        .child(self.header_button(&format!("revert-{id}"), "undo", "Revert", theme, cx, move |this, cx| {
+                            this.session.file.focus = Some(revert_id.clone());
+                            this.exec("record.revert", cx);
+                        }));
+                }
+                row
+            })
     }
 
     fn header_button(
@@ -175,7 +202,7 @@ impl Root {
         let width = px(148. * columns.len().max(1) as f32);
         let body = if master {
             self.session.sync_master(id);
-            let total = self.session.backend.master_total(entity);
+            let total = self.session.table_len(id);
             let known = self.session.backend.master_known(entity);
             if !known {
                 div().flex_1().p_4().text_color(rgb(theme.muted)).child("Loading the first window…").into_any_element()
@@ -197,7 +224,7 @@ impl Root {
                         root.session.backend.master_touch(&entity, range.start, range.end);
                         let mut items = Vec::with_capacity(range.len());
                         for index in range {
-                            if let Some(row) = root.session.backend.master_at(&entity, index) {
+                            if let Some(row) = root.session.master_row(&entity, index) {
                                 let on = selected.as_deref() == Some(row.id.as_str());
                                 items.push(root.table_row(index, &view_id, &entity, &columns, &row, on, &theme, cx));
                             } else {
@@ -281,6 +308,7 @@ impl Root {
                     .child(body),
             )
             .children(chooser)
+            .children(self.choice_strip(id, theme, cx))
             .into_any_element()
     }
 
@@ -310,20 +338,43 @@ impl Root {
             .border_l(px(3.))
             .border_color(rgb(if on { theme.accent } else { theme.panel }))
             .hover(|style| style.bg(rgb(if on { theme.accent_dim } else { theme.hover })).text_color(rgb(theme.text)))
-            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                this.session.select(&view_id, &record_id);
-                cx.notify();
-            }));
+            .on_click({
+                let view_id = view_id.clone();
+                let record_id = record_id.clone();
+                cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                    this.session.select(&view_id, &record_id);
+                    cx.notify();
+                })
+            });
         for column in columns {
+            let column_id = column.clone();
+            let record_for_cell = record_id.clone();
+            let view_for_cell = view_id.clone();
+            let editing = self.session.editing.as_ref().filter(|edit| {
+                edit.view == view_id && edit.record_id == row.id && edit.field == column.as_str()
+            });
+            let editor = editing.map(|edit| edit.edit.clone());
+            let invalid = editing.and_then(|edit| edit.error.clone());
             line = line.child(
                 div()
+                    .id(SharedString::from(format!("cell-{view_id}-{index}-{column}")))
                     .w(px(148.))
                     .flex_shrink_0()
                     .px_2()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_size(px(12.))
-                    .child(self.session.cell(entity, column, row)),
+                    .text_color(rgb(if invalid.is_some() { theme.warn } else { theme.text }))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
+                    .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                        this.session.select(&view_for_cell, &record_for_cell);
+                        this.session.begin_edit(&view_for_cell, &record_for_cell, &column_id);
+                        cx.notify();
+                    }))
+                    .child(match editor {
+                        Some(edit) => crate::edit::render_edit_line(&edit, "", theme),
+                        None => div().child(self.session.cell(entity, column, row)).into_any_element(),
+                    }),
             );
         }
         line.into_any_element()
@@ -470,14 +521,39 @@ impl Root {
                     );
                 } else if field.children.is_empty() {
                     let text = self.session.cell(entity, &field.id, &record);
+                    let field_id = field.id.clone();
+                    let record_id = record.id.clone();
+                    let view_id = id.to_string();
+                    let editor = self.session.editing.as_ref().filter(|edit| {
+                        edit.view == id && edit.record_id == record.id && edit.field == field.id
+                    }).map(|edit| edit.edit.clone());
+                    let invalid = self.session.editing.as_ref().and_then(|edit| {
+                        (edit.view == id && edit.field == field.id).then(|| edit.error.clone()).flatten()
+                    });
                     body = body.child(
                         div()
+                            .id(SharedString::from(format!("field-{id}-{}", field.id)))
                             .flex()
                             .flex_row()
                             .gap_3()
                             .py(px(3.))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(rgb(theme.hover)))
+                            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                                this.session.select(&view_id, &record_id);
+                                this.session.begin_edit(&view_id, &record_id, &field_id);
+                                cx.notify();
+                            }))
                             .child(div().w(px(180.)).text_color(rgb(theme.muted)).child(field.label.clone()))
-                            .child(div().flex_1().child(if text.is_empty() { "—".to_string() } else { text })),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_color(rgb(if invalid.is_some() { theme.warn } else { theme.text }))
+                                    .child(match editor {
+                                        Some(edit) => crate::edit::render_edit_line(&edit, "Empty", theme),
+                                        None => div().child(if text.is_empty() { "—".to_string() } else { text }).into_any_element(),
+                                    }),
+                            ),
                     );
                 }
             }
@@ -490,7 +566,33 @@ impl Root {
             .flex_col()
             .child(self.view_header(id, theme, cx))
             .child(body)
+            .children(self.choice_strip(id, theme, cx))
             .into_any_element()
+    }
+
+    fn choice_strip(&self, view: &str, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let edit = self.session.editing.as_ref().filter(|edit| edit.view == view && !edit.choices.is_empty())?;
+        let choices: Vec<(String, String)> = edit.choices.iter().take(16).cloned().collect();
+        let mut row = div().flex().flex_row().flex_wrap().gap_1().px_2().py_1().bg(rgb(theme.raised));
+        for (index, (_code, label)) in choices.into_iter().enumerate() {
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("choice-{view}-{index}")))
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(rgb(theme.accent))
+                    .text_color(rgb(theme.on_accent))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                        this.session.pick_choice(index);
+                        this.session.commit_edit(crate::session::EditMove::Stay);
+                        cx.notify();
+                    })),
+            );
+        }
+        Some(row.into_any_element())
     }
 
     fn render_tree(&self, id: &str, entity: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {

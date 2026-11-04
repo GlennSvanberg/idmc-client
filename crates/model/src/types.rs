@@ -725,11 +725,12 @@ fn check_value_map(
 ) -> Result<(), ModelError> {
     let known: BTreeSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
     for key in values.keys() {
-        if !known.contains(key.as_str()) {
-            return Err(ModelError::Message(format!(
-                "{path} has unknown field {key}"
-            )));
+        if key.starts_with('_') || known.contains(key.as_str()) {
+            continue;
         }
+        return Err(ModelError::Message(format!(
+            "{path} has unknown field {key}"
+        )));
     }
     for field in fields {
         if field.system {

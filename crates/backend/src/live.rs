@@ -13,15 +13,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use idmc_model::{
-    expand_key, FieldDef, FieldType, FieldValue, GraphEdge, IdmcExportSource, JsonModelSource,
-    ModelDefinition, ModelSource, NodeId, Record, Scene,
+    api_body, expand_key, patch_ops, FieldDef, FieldType, FieldValue, GraphEdge, IdmcExportSource,
+    JsonModelSource, ModelDefinition, ModelSource, NodeId, Record, Scene,
 };
 use serde_json::{Map, Value};
 
 use crate::config::env_path;
 use crate::{
-    hierarchy_children_of, hierarchy_roots_of, label_text, records_of, related_of, Backend,
-    BackendError, SearchHit,
+    apply_records, create_path, delete_path, hierarchy_children_of, hierarchy_roots_of, label_text,
+    patch_path, records_of, related_of, Backend, BackendError, SearchHit, WriteKind, WriteNotice, WriteOp,
 };
 
 const PAGE: u64 = 500;
@@ -56,6 +56,7 @@ struct Shared {
     last_publish_ms: AtomicU64,
     last_error: Mutex<Option<String>>,
     hub: Mutex<Hub>,
+    notices: Mutex<Vec<WriteNotice>>,
 }
 
 struct Hub {
@@ -107,6 +108,7 @@ struct Cache {
     lookups: BTreeMap<(String, String), String>,
     hydrated: BTreeSet<String>,
     inflight: BTreeSet<String>,
+    sources: HashMap<(String, String), (String, String)>,
 }
 
 impl Default for Cache {
@@ -117,6 +119,7 @@ impl Default for Cache {
             lookups: BTreeMap::new(),
             hydrated: BTreeSet::new(),
             inflight: BTreeSet::new(),
+            sources: HashMap::new(),
         }
     }
 }
@@ -202,6 +205,7 @@ impl LiveBackend {
             seen: AtomicU64::new(0),
             last_publish_ms: AtomicU64::new(0),
             last_error: Mutex::new(None),
+            notices: Mutex::new(Vec::new()),
             hub: Mutex::new(Hub {
                 views: HashMap::new(),
                 started: Instant::now(),
@@ -761,6 +765,239 @@ impl Backend for LiveBackend {
         let cache = lock(&self.shared.cache);
         cache.lookups.get(&(lookup.to_string(), code.to_string())).cloned()
     }
+
+    fn submit_write(&self, mut op: WriteOp) -> Result<Record, BackendError> {
+        if op.source_pkey.is_empty() {
+            let cache = lock(&self.shared.cache);
+            if let Some((_, pkey)) = cache.sources.get(&(op.entity.clone(), op.id.clone())) {
+                op.source_pkey = pkey.clone();
+            }
+        }
+        let before = {
+            let cache = lock(&self.shared.cache);
+            cache.records.iter().find(|row| row.entity == op.entity && row.id == op.id).cloned()
+        };
+        let saved = {
+            let mut cache = lock(&self.shared.cache);
+            let mut records = cache.records.clone();
+            let saved = apply_records(&self.model, &mut records, &op)?;
+            if op.kind == WriteKind::Create {
+                cache.sources.insert(
+                    (saved.entity.clone(), saved.id.clone()),
+                    (op.source_system.clone(), op.source_pkey.clone()),
+                );
+            }
+            if op.kind == WriteKind::Delete {
+                cache.sources.remove(&(op.entity.clone(), op.id.clone()));
+            }
+            set_cache_records(&mut cache, records);
+            saved
+        };
+        {
+            let mut hub = lock(&self.shared.hub);
+            match op.kind {
+                WriteKind::Create => insert_in_pages(&mut hub, &saved),
+                WriteKind::Update => replace_in_pages(&mut hub, &saved),
+                WriteKind::Delete => remove_from_pages(&mut hub, &op.entity, &op.id),
+            }
+        }
+        publish(&self.shared, true);
+        let shared = Arc::clone(&self.shared);
+        let model = Arc::clone(&self.model);
+        let optimistic = saved.clone();
+        std::thread::Builder::new()
+            .name("idmc-write".into())
+            .spawn(move || finish_write(shared, model, op, before, optimistic))
+            .map_err(|err| BackendError::Message(format!("write thread: {err}")))?;
+        Ok(saved)
+    }
+
+    fn take_write_notice(&self) -> Option<WriteNotice> {
+        let mut notices = self.shared.notices.lock().unwrap_or_else(|err| err.into_inner());
+        if notices.is_empty() { None } else { Some(notices.remove(0)) }
+    }
+}
+
+fn set_cache_records(cache: &mut Cache, records: Vec<Record>) {
+    cache.index.clear();
+    for (index, record) in records.iter().enumerate() {
+        cache.index.insert(index_key(&record.entity, &record.id), index);
+    }
+    cache.records = records;
+}
+
+fn replace_in_pages(hub: &mut Hub, record: &Record) {
+    let Some(view) = hub.views.get_mut(&record.entity) else { return };
+    for page in view.pages.values_mut() {
+        if let Some(slot) = page.iter_mut().find(|row| row.id == record.id) {
+            *slot = record.clone();
+        }
+    }
+}
+
+fn remove_from_pages(hub: &mut Hub, entity: &str, id: &str) {
+    let Some(view) = hub.views.get_mut(entity) else { return };
+    let mut removed = false;
+    for page in view.pages.values_mut() {
+        let before = page.len();
+        page.retain(|row| row.id != id);
+        if page.len() != before {
+            removed = true;
+        }
+    }
+    if removed {
+        if let Some(hits) = view.hits.as_mut() {
+            *hits = hits.saturating_sub(1);
+        }
+    }
+}
+
+fn insert_in_pages(hub: &mut Hub, record: &Record) {
+    let Some(view) = hub.views.get_mut(&record.entity) else { return };
+    if let Some(page) = view.pages.get_mut(&0) {
+        page.insert(0, record.clone());
+    }
+    if let Some(hits) = view.hits.as_mut() {
+        *hits += 1;
+    }
+}
+
+fn finish_write(shared: Arc<Shared>, model: Arc<ModelDefinition>, op: WriteOp, before: Option<Record>, optimistic: Record) {
+    let Some(base) = shared.http.mdm_base() else {
+        fail_write(&shared, &op, before.as_ref(), &optimistic, "not logged in");
+        return;
+    };
+    let result = match op.kind {
+        WriteKind::Create => {
+            let url = format!("{base}{}", create_path(&op.entity, &op.source_system, &op.source_pkey));
+            shared.http.note(&format!("create POST {url}"));
+            shared.http.post_json(&url, &api_body(&model, &op.entity, &op.values))
+        }
+        WriteKind::Update => {
+            let url = format!("{base}{}", patch_path(&op.entity, &op.id, &op.source_system));
+            let previous = before.as_ref().map(|row| row.values.clone()).unwrap_or_default();
+            shared.http.note(&format!("update PATCH {url}"));
+            shared.http.send("PATCH", &url, Some(&patch_ops(&model, &op.entity, &previous, &op.values)))
+        }
+        WriteKind::Delete => {
+            let pkey = if op.source_pkey.is_empty() { None } else { Some(op.source_pkey.as_str()) };
+            let url = format!("{base}{}", delete_path(&op.entity, &op.id, &op.source_system, pkey));
+            shared.http.note(&format!("delete DELETE {url}"));
+            shared.http.send("DELETE", &url, None)
+        }
+    };
+    match result {
+        Ok(value) => {
+            let assigned = value
+                .get("businessId")
+                .or_else(|| value.get("id"))
+                .and_then(|item| item.as_str())
+                .filter(|id| *id != optimistic.id)
+                .map(str::to_string);
+            if let Some(id) = &assigned {
+                rename_record(&shared, &optimistic, id);
+            }
+            let message = value.get("approvalRequired").and_then(|flag| flag.as_bool()).unwrap_or(false).then(|| {
+                "Saved. A data steward must approve this change.".to_string()
+            });
+            push_notice(
+                &shared,
+                WriteNotice {
+                    error: None,
+                    message,
+                    entity: optimistic.entity,
+                    from_id: optimistic.id,
+                    to_id: assigned,
+                    restore: None,
+                },
+            );
+        }
+        Err(err) => fail_write(&shared, &op, before.as_ref(), &optimistic, &err.to_string()),
+    }
+}
+
+fn fail_write(shared: &Shared, op: &WriteOp, before: Option<&Record>, optimistic: &Record, message: &str) {
+    let mut rolled = false;
+    {
+        let mut cache = lock(&shared.cache);
+        let pos = cache.records.iter().position(|row| row.entity == optimistic.entity && row.id == optimistic.id);
+        let current = pos.and_then(|index| cache.records.get(index));
+        if current.is_some_and(|row| row.values == optimistic.values) {
+            let mut records = cache.records.clone();
+            if let Some(index) = pos {
+                if let Some(previous) = before {
+                    records[index] = previous.clone();
+                } else {
+                    records.remove(index);
+                }
+                set_cache_records(&mut cache, records);
+                rolled = true;
+            }
+        }
+    }
+    if rolled {
+        let mut hub = lock(&shared.hub);
+        match op.kind {
+            WriteKind::Create => remove_from_pages(&mut hub, &optimistic.entity, &optimistic.id),
+            WriteKind::Update => {
+                if let Some(previous) = before {
+                    replace_in_pages(&mut hub, previous);
+                }
+            }
+            WriteKind::Delete => {
+                if let Some(previous) = before {
+                    insert_in_pages(&mut hub, previous);
+                }
+            }
+        }
+    }
+    push_notice(
+        shared,
+        WriteNotice {
+            error: Some(message.to_string()),
+            message: None,
+            entity: optimistic.entity.clone(),
+            from_id: optimistic.id.clone(),
+            to_id: None,
+            restore: rolled.then(|| optimistic.clone()),
+        },
+    );
+    publish(shared, true);
+}
+
+fn rename_record(shared: &Shared, optimistic: &Record, assigned: &str) {
+    {
+        let mut cache = lock(&shared.cache);
+        let pos = cache.records.iter().position(|row| row.entity == optimistic.entity && row.id == optimistic.id);
+        let same = pos.and_then(|index| cache.records.get(index)).is_some_and(|row| row.values == optimistic.values);
+        if same {
+            let mut records = cache.records.clone();
+            if let Some(index) = pos {
+                records[index].id = assigned.to_string();
+                if let Some(source) = cache.sources.remove(&(optimistic.entity.clone(), optimistic.id.clone())) {
+                    cache.sources.insert((optimistic.entity.clone(), assigned.to_string()), source);
+                }
+                set_cache_records(&mut cache, records);
+            }
+        } else {
+            return;
+        }
+    }
+    let mut hub = lock(&shared.hub);
+    if let Some(view) = hub.views.get_mut(&optimistic.entity) {
+        for page in view.pages.values_mut() {
+            if let Some(slot) = page.iter_mut().find(|row| row.id == optimistic.id && row.values == optimistic.values) {
+                slot.id = assigned.to_string();
+            }
+        }
+    }
+    publish(shared, true);
+}
+
+fn push_notice(shared: &Shared, notice: WriteNotice) {
+    if let Ok(mut notices) = shared.notices.lock() {
+        notices.push(notice);
+    }
 }
 
 fn fetch_page(
@@ -1251,6 +1488,9 @@ impl IdmcHttp {
         let info = session.as_ref().ok_or_else(|| BackendError::Message("not logged in".into()))?;
         let mut request = match method {
             "POST" => self.http.post(url),
+            "PUT" => self.http.put(url),
+            "PATCH" => self.http.patch(url),
+            "DELETE" => self.http.delete(url),
             _ => self.http.get(url),
         };
         request = request

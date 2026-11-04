@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use idmc_backend::{
-    check_login, load_dotenv, read_env, AppBackend, Backend, BackendMode, LiveConfig, MockBackend,
-    SearchHit,
+    check_login, load_dotenv, project_children, read_env, AppBackend, Backend, BackendMode, LiveConfig,
+    MockBackend, SearchHit, WriteKind, WriteOp,
 };
 use idmc_layout::{Node, Zone};
 use idmc_model::{value_at, FieldDef, FieldType, FieldValue, Record, ViewKind};
@@ -92,13 +92,35 @@ pub enum MenuCommand {
 
 struct CachedRows {
     generation: u64,
+    revision: u64,
     source: Option<String>,
     rows: Arc<Vec<Record>>,
 }
 
 struct CellCache {
     generation: u64,
+    revision: u64,
     values: HashMap<(String, String, String), String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CellEdit {
+    pub view: String,
+    pub record_id: String,
+    pub entity: String,
+    pub field: String,
+    pub edit: TextEdit,
+    pub choices: Vec<(String, String)>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditMove {
+    Stay,
+    NextField,
+    PrevField,
+    Down,
+    Up,
 }
 
 pub struct Session {
@@ -126,6 +148,11 @@ pub struct Session {
     pub graph_query: bool,
     pub graph_edit: TextEdit,
     pub graph_origin: RefCell<(f32, f32, f32, f32)>,
+    pub editing: Option<CellEdit>,
+    pub drafts: HashMap<String, Record>,
+    draft_rev: u64,
+    new_seq: u64,
+    pub pending_delete: Option<(String, String, String)>,
 }
 
 pub enum Launch {
@@ -155,6 +182,7 @@ impl Session {
             row_cache: RefCell::new(HashMap::new()),
             cell_cache: RefCell::new(CellCache {
                 generation: u64::MAX,
+                revision: 0,
                 values: HashMap::new(),
             }),
             seen_generation: u64::MAX,
@@ -168,6 +196,11 @@ impl Session {
             graph_query: false,
             graph_edit: TextEdit::new(),
             graph_origin: RefCell::new((0.0, 0.0, 800.0, 600.0)),
+            editing: None,
+            drafts: HashMap::new(),
+            draft_rev: 0,
+            new_seq: 0,
+            pending_delete: None,
         }
     }
 
@@ -219,7 +252,7 @@ impl Session {
         let generation = self.backend.generation();
         let source = self.row_source(view_id);
         if let Some(hit) = self.row_cache.borrow().get(view_id) {
-            if hit.generation == generation && hit.source == source {
+            if hit.generation == generation && hit.revision == self.draft_rev && hit.source == source {
                 return Arc::clone(&hit.rows);
             }
         }
@@ -228,6 +261,7 @@ impl Session {
             view_id.to_string(),
             CachedRows {
                 generation,
+                revision: self.draft_rev,
                 source,
                 rows: Arc::clone(&rows),
             },
@@ -246,9 +280,29 @@ impl Session {
             return Arc::new(Vec::new());
         }
         if spec.link.is_none() && spec.kind != ViewKind::Tree {
-            return self.backend.shared_records(&spec.entity);
+            let mut rows = self.backend.shared_records(&spec.entity).as_ref().clone();
+            self.merge_drafts(&spec.entity, &mut rows);
+            return Arc::new(rows);
         }
         Arc::new(self.compute_rows(view_id))
+    }
+
+    fn merge_drafts(&self, entity: &str, rows: &mut Vec<Record>) {
+        for row in rows.iter_mut() {
+            if let Some(draft) = self.drafts.get(&draft_key(&row.entity, &row.id)) {
+                *row = draft.clone();
+            }
+        }
+        let mut extra = Vec::new();
+        for draft in self.drafts.values() {
+            if draft.entity == entity && draft.id.starts_with("new:") && !rows.iter().any(|row| row.id == draft.id) {
+                extra.push(draft.clone());
+            }
+        }
+        if !extra.is_empty() {
+            extra.append(rows);
+            *rows = extra;
+        }
     }
 
     fn compute_rows(&self, view_id: &str) -> Vec<Record> {
@@ -256,7 +310,20 @@ impl Session {
         if let Some(link) = &spec.link {
             let Some(selected) = self.file.selections.get(&link.source) else { return Vec::new() };
             if link.relationship == "identity" {
-                return self.backend.record(&spec.entity, selected).into_iter().collect();
+                return self
+                    .backend
+                    .record(&spec.entity, selected)
+                    .map(|row| self.overlay_row(row))
+                    .into_iter()
+                    .collect();
+            }
+            if let Some(rel) = self.backend.model().relationship(&link.relationship).cloned() {
+                if rel.embedded {
+                    let key = draft_key(&rel.from, selected);
+                    if let Some(parent) = self.drafts.get(&key) {
+                        return idmc_backend::project_children(self.backend.model(), parent, &rel.to);
+                    }
+                }
             }
             return self.backend.related(&link.relationship, selected).unwrap_or_default();
         }
@@ -385,7 +452,7 @@ impl Session {
         let key = (entity.to_string(), record.id.clone(), field_id.to_string());
         {
             let cache = self.cell_cache.borrow();
-            if cache.generation == generation {
+            if cache.generation == generation && cache.revision == self.draft_rev {
                 if let Some(hit) = cache.values.get(&key) {
                     return hit.clone();
                 }
@@ -393,9 +460,10 @@ impl Session {
         }
         let text = self.compute_cell(entity, field_id, record);
         let mut cache = self.cell_cache.borrow_mut();
-        if cache.generation != generation {
+        if cache.generation != generation || cache.revision != self.draft_rev {
             cache.values.clear();
             cache.generation = generation;
+            cache.revision = self.draft_rev;
         }
         cache.values.insert(key, text.clone());
         text
@@ -479,6 +547,12 @@ impl Session {
             }
             "selection.next" => self.nudge_selection(1),
             "selection.prev" => self.nudge_selection(-1),
+            "record.new" => self.new_record(),
+            "record.new_child" => self.new_child(),
+            "record.save" => self.save_records(),
+            "record.revert" => self.revert_records(),
+            "record.delete" => self.ask_delete(),
+            "record.delete_confirm" => self.confirm_delete(),
             _ => self.status = format!("Unknown action {id}"),
         }
         Effect::None
@@ -756,6 +830,9 @@ impl Session {
 
     pub fn absorb_async(&mut self) -> bool {
         let mut changed = false;
+        if self.absorb_writes() {
+            changed = true;
+        }
         if let Some(hits) = self.backend.take_record_search() {
             if self.graph_query {
                 self.seed_graph(&hits);
@@ -963,7 +1040,7 @@ impl Session {
         if self.is_master_table(view_id) {
             self.sync_master(view_id);
             let entity = self.spec(view_id).map(|spec| spec.entity.clone()).unwrap_or_default();
-            return self.backend.master_total(&entity);
+            return self.pending_count(&entity) + self.backend.master_total(&entity);
         }
         self.rows_cached(view_id).len()
     }
@@ -1238,6 +1315,529 @@ impl Session {
         self.file.layout.activate(view);
         self.file.selections.insert(view.to_string(), record.to_string());
         self.reconcile();
+    }
+
+    pub fn dirty_records(&self) -> bool {
+        !self.drafts.is_empty() || self.editing.is_some()
+    }
+
+    pub fn pending_count(&self, entity: &str) -> usize {
+        self.drafts
+            .values()
+            .filter(|row| row.entity == entity && row.id.starts_with("new:"))
+            .count()
+    }
+
+    pub fn master_row(&self, entity: &str, index: usize) -> Option<Record> {
+        let mut pending: Vec<Record> = self
+            .drafts
+            .values()
+            .filter(|row| row.entity == entity && row.id.starts_with("new:"))
+            .cloned()
+            .collect();
+        pending.sort_by(|left, right| left.id.cmp(&right.id));
+        if index < pending.len() {
+            return Some(pending[index].clone());
+        }
+        let row = self.backend.master_at(entity, index - pending.len())?;
+        Some(self.overlay_row(row))
+    }
+
+    fn overlay_row(&self, row: Record) -> Record {
+        self.drafts.get(&draft_key(&row.entity, &row.id)).cloned().unwrap_or(row)
+    }
+
+    pub fn begin_edit(&mut self, view: &str, record_id: &str, field_id: &str) {
+        let Some(entity) = self.spec(view).map(|spec| spec.entity.clone()) else { return };
+        let Some(field) = self.backend.model().entity(&entity).and_then(|entry| entry.field(field_id)).cloned() else {
+            return;
+        };
+        if field.system || field.ty == FieldType::Group || field.many {
+            self.status = format!("{} is not edited in a cell", field.label);
+            return;
+        }
+        let Some(record) = self.record_for_edit(&entity, record_id) else {
+            self.status = "That row is not loaded".into();
+            return;
+        };
+        let text = idmc_model::edit_text(self.backend.model(), &field, idmc_model::read_field(&record, &field));
+        let mut edit = TextEdit::new();
+        for ch in text.chars() {
+            edit.insert(ch);
+        }
+        let choices = idmc_model::lookup_choices(self.backend.model(), field.lookup.as_deref());
+        self.file.focus = Some(view.to_string());
+        self.editing = Some(CellEdit {
+            view: view.to_string(),
+            record_id: record_id.to_string(),
+            entity,
+            field: field_id.to_string(),
+            edit,
+            choices,
+            error: None,
+        });
+    }
+
+    fn record_for_edit(&self, entity: &str, id: &str) -> Option<Record> {
+        if let Some(draft) = self.drafts.get(&draft_key(entity, id)) {
+            return Some(draft.clone());
+        }
+        if self.backend.model().entity(entity).and_then(|entry| entry.embedded_in.clone()).is_some() {
+            if let Some((parent_id, _, _)) = idmc_model::split_child_id(id) {
+                let parent_entity = self.backend.model().entity(entity)?.embedded_in.as_ref()?.parent.clone();
+                let parent = self
+                    .drafts
+                    .get(&draft_key(&parent_entity, &parent_id))
+                    .cloned()
+                    .or_else(|| self.backend.record(&parent_entity, &parent_id))?;
+                return project_children(self.backend.model(), &parent, entity)
+                    .into_iter()
+                    .find(|row| row.id == id);
+            }
+        }
+        self.backend.record(entity, id).or_else(|| {
+            self.drafts.values().find(|row| row.entity == entity && row.id == id).cloned()
+        })
+    }
+
+    pub fn commit_edit(&mut self, next: EditMove) -> bool {
+        let Some(edit) = self.editing.clone() else { return true };
+        let Some(field) = self.backend.model().entity(&edit.entity).and_then(|entry| entry.field(&edit.field)).cloned() else {
+            self.editing = None;
+            return true;
+        };
+        let value = match idmc_model::parse_field(&field, &edit.edit.text, self.backend.model()) {
+            Ok(value) => value,
+            Err(message) => {
+                if let Some(slot) = self.editing.as_mut() {
+                    slot.error = Some(message.clone());
+                }
+                self.status = message;
+                return false;
+            }
+        };
+        if let Err(message) = self.write_field(&edit.entity, &edit.record_id, &field, value) {
+            self.status = message;
+            return false;
+        }
+        self.editing = None;
+        if next != EditMove::Stay {
+            self.open_neighbor(&edit, next);
+        }
+        true
+    }
+
+    pub fn cancel_edit(&mut self) {
+        self.editing = None;
+    }
+
+    fn write_field(&mut self, entity: &str, record_id: &str, field: &FieldDef, value: FieldValue) -> Result<(), String> {
+        if let Some(embedded) = self.backend.model().entity(entity).and_then(|entry| entry.embedded_in.clone()) {
+            let (parent_id, group, index) = idmc_model::split_child_id(record_id).ok_or("child row id is not usable")?;
+            let mut parent = self
+                .drafts
+                .get(&draft_key(&embedded.parent, &parent_id))
+                .cloned()
+                .or_else(|| self.backend.record(&embedded.parent, &parent_id))
+                .ok_or_else(|| "parent record is not loaded".to_string())?;
+            if !idmc_model::set_child_field(&mut parent, &group, index, &field.name, value) {
+                return Err("that child row is gone".into());
+            }
+            self.remember_draft(parent);
+            return Ok(());
+        }
+        let mut record = self
+            .drafts
+            .get(&draft_key(entity, record_id))
+            .cloned()
+            .or_else(|| self.backend.record(entity, record_id))
+            .ok_or_else(|| "record is not loaded".to_string())?;
+        if matches!(value, FieldValue::Null) {
+            record.values.remove(&field.name);
+        } else {
+            record.values.insert(field.name.clone(), value);
+        }
+        self.remember_draft(record);
+        Ok(())
+    }
+
+    fn remember_draft(&mut self, record: Record) {
+        self.drafts.insert(draft_key(&record.entity, &record.id), record);
+        self.draft_rev = self.draft_rev.wrapping_add(1);
+    }
+
+    fn open_neighbor(&mut self, edit: &CellEdit, next: EditMove) {
+        let fields = self.edit_fields(&edit.view, &edit.entity);
+        let rows = self.edit_rows(&edit.view);
+        if fields.is_empty() || rows.is_empty() {
+            return;
+        }
+        let field_at = fields.iter().position(|id| id == &edit.field).unwrap_or(0);
+        let row_at = rows.iter().position(|id| id == &edit.record_id).unwrap_or(0);
+        let (field_at, row_at) = match next {
+            EditMove::Stay => return,
+            EditMove::NextField => ((field_at + 1).min(fields.len() - 1), row_at),
+            EditMove::PrevField => (field_at.saturating_sub(1), row_at),
+            EditMove::Down => (field_at, (row_at + 1).min(rows.len() - 1)),
+            EditMove::Up => (field_at, row_at.saturating_sub(1)),
+        };
+        let field = &fields[field_at];
+        let row = &rows[row_at];
+        if field == &edit.field && row == &edit.record_id {
+            return;
+        }
+        self.begin_edit(&edit.view, row, field);
+    }
+
+    fn edit_fields(&self, view: &str, entity: &str) -> Vec<String> {
+        if let Some(spec) = self.spec(view) {
+            if spec.kind == ViewKind::Table && !spec.columns.is_empty() {
+                return spec.columns.iter().filter(|column| self.field_editable(entity, column)).cloned().collect();
+            }
+        }
+        self.backend
+            .model()
+            .entity(entity)
+            .map(|entry| {
+                entry
+                    .fields
+                    .iter()
+                    .filter(|field| self.field_editable(entity, &field.id))
+                    .map(|field| field.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn field_editable(&self, entity: &str, field_id: &str) -> bool {
+        self.backend.model().entity(entity).and_then(|entry| entry.field(field_id)).is_some_and(|field| {
+            !field.system && field.ty != FieldType::Group && !field.many
+        })
+    }
+
+    fn edit_rows(&self, view: &str) -> Vec<String> {
+        if self.is_master_table(view) {
+            let entity = self.spec(view).map(|spec| spec.entity.clone()).unwrap_or_default();
+            let total = self.pending_count(&entity) + self.backend.master_total(&entity);
+            return (0..total).filter_map(|index| self.master_row(&entity, index).map(|row| row.id)).collect();
+        }
+        self.visible_ids(view)
+    }
+
+    pub fn edit_insert(&mut self, ch: char) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.edit.insert(ch);
+            edit.error = None;
+        }
+    }
+
+    pub fn edit_backspace(&mut self) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.edit.backspace();
+            edit.error = None;
+        }
+    }
+
+    pub fn edit_delete_forward(&mut self) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.edit.delete_forward();
+        }
+    }
+
+    pub fn edit_left(&mut self, shift: bool) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.edit.move_left(shift);
+        }
+    }
+
+    pub fn edit_right(&mut self, shift: bool) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.edit.move_right(shift);
+        }
+    }
+
+    pub fn edit_home(&mut self, shift: bool) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.edit.home(shift);
+        }
+    }
+
+    pub fn edit_end(&mut self, shift: bool) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.edit.end(shift);
+        }
+    }
+
+    pub fn cycle_choice(&mut self, delta: i32) {
+        let Some(edit) = self.editing.as_mut() else { return };
+        if edit.choices.is_empty() {
+            return;
+        }
+        let current = edit
+            .choices
+            .iter()
+            .position(|(code, label)| label.eq_ignore_ascii_case(&edit.edit.text) || code.eq_ignore_ascii_case(&edit.edit.text))
+            .unwrap_or(0);
+        let len = edit.choices.len() as i32;
+        let next = (current as i32 + delta).rem_euclid(len) as usize;
+        let label = edit.choices[next].1.clone();
+        edit.edit = TextEdit::new();
+        for ch in label.chars() {
+            edit.edit.insert(ch);
+        }
+        edit.error = None;
+    }
+
+    pub fn pick_choice(&mut self, index: usize) {
+        let Some(edit) = self.editing.as_mut() else { return };
+        let Some((_, label)) = edit.choices.get(index).cloned() else { return };
+        edit.edit = TextEdit::new();
+        for ch in label.chars() {
+            edit.edit.insert(ch);
+        }
+        edit.error = None;
+    }
+
+    pub fn save_records(&mut self) {
+        if self.editing.is_some() && !self.commit_edit(EditMove::Stay) {
+            return;
+        }
+        let keys: Vec<String> = self.drafts.keys().cloned().collect();
+        if keys.is_empty() {
+            self.status = "Nothing to save".into();
+            return;
+        }
+        for key in keys {
+            let Some(record) = self.drafts.get(&key).cloned() else { continue };
+            if let Err(err) = self.write_record(record) {
+                self.status = err;
+                return;
+            }
+        }
+        self.draft_rev = self.draft_rev.wrapping_add(1);
+        self.status = "Saved".into();
+    }
+
+    fn write_record(&mut self, record: Record) -> Result<(), String> {
+        idmc_model::validate_edit(self.backend.model(), &record.entity, &record.values).map_err(|err| err.to_string())?;
+        let exists = self.backend.record(&record.entity, &record.id).is_some();
+        let kind = if record.id.starts_with("new:") || !exists {
+            WriteKind::Create
+        } else {
+            WriteKind::Update
+        };
+        let source_pkey = if kind == WriteKind::Create {
+            format!("idmc-{}", record.id.trim_start_matches("new:"))
+        } else {
+            String::new()
+        };
+        let before = self.backend.record(&record.entity, &record.id);
+        let saved = self
+            .backend
+            .submit_write(WriteOp {
+                kind,
+                entity: record.entity.clone(),
+                id: record.id.clone(),
+                source_system: idmc_model::DEFAULT_SOURCE_SYSTEM.into(),
+                source_pkey,
+                values: record.values.clone(),
+                before,
+            })
+            .map_err(|err| err.to_string())?;
+        self.drafts.remove(&draft_key(&record.entity, &record.id));
+        self.retarget_id(&record.id, &saved.id);
+        Ok(())
+    }
+
+    fn retarget_id(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        for selection in self.file.selections.values_mut() {
+            if selection == from {
+                *selection = to.to_string();
+            }
+        }
+    }
+
+    pub fn revert_records(&mut self) {
+        self.editing = None;
+        self.drafts.clear();
+        self.pending_delete = None;
+        self.draft_rev = self.draft_rev.wrapping_add(1);
+        self.status = "Reverted unsaved changes".into();
+    }
+
+    pub fn new_record(&mut self) {
+        let Some(view) = self.file.focus.clone() else {
+            self.status = "Focus a table or detail view first".into();
+            return;
+        };
+        let Some(spec) = self.spec(&view).cloned() else { return };
+        if self.backend.model().entity(&spec.entity).and_then(|entry| entry.embedded_in.clone()).is_some() {
+            self.new_child();
+            return;
+        }
+        if matches!(spec.kind, ViewKind::Graph | ViewKind::Tree) {
+            self.status = "Create records from a table or a detail view".into();
+            return;
+        }
+        self.new_seq = self.new_seq.wrapping_add(1);
+        let id = format!("new:{}", self.new_seq);
+        let record = Record {
+            entity: spec.entity.clone(),
+            id: id.clone(),
+            values: std::collections::BTreeMap::new(),
+        };
+        self.remember_draft(record);
+        self.select(&view, &id);
+        if let Some(field) = self.edit_fields(&view, &spec.entity).into_iter().next() {
+            self.begin_edit(&view, &id, &field);
+        }
+        self.status = "New record. Fill the required fields, then save.".into();
+    }
+
+    pub fn new_child(&mut self) {
+        let Some(view) = self.file.focus.clone() else {
+            self.status = "Focus a child table first".into();
+            return;
+        };
+        let Some(spec) = self.spec(&view).cloned() else { return };
+        let Some(embedded) = self.backend.model().entity(&spec.entity).and_then(|entry| entry.embedded_in.clone()) else {
+            self.status = "This view is not a child table".into();
+            return;
+        };
+        let Some(link) = spec.link.clone() else {
+            self.status = "Link this child table to a parent row first".into();
+            return;
+        };
+        let Some(parent_id) = self.file.selections.get(&link.source).cloned() else {
+            self.status = "Select a parent row first".into();
+            return;
+        };
+        let Some(mut parent) = self
+            .drafts
+            .get(&draft_key(&embedded.parent, &parent_id))
+            .cloned()
+            .or_else(|| self.backend.record(&embedded.parent, &parent_id))
+        else {
+            self.status = "The parent record is not loaded".into();
+            return;
+        };
+        let index = idmc_model::push_child(&mut parent, &embedded.field, std::collections::BTreeMap::new());
+        let child_id = idmc_model::child_record_id(&parent.id, &embedded.field, index);
+        self.remember_draft(parent);
+        self.select(&view, &child_id);
+        if let Some(field) = self.edit_fields(&view, &spec.entity).into_iter().next() {
+            self.begin_edit(&view, &child_id, &field);
+        }
+        self.status = "New child row. Save when the fields are ready.".into();
+    }
+
+    pub fn ask_delete(&mut self) {
+        if self.pending_delete.is_some() {
+            self.confirm_delete();
+            return;
+        }
+        let Some(view) = self.file.focus.clone() else {
+            self.status = "Focus a row first".into();
+            return;
+        };
+        let Some(id) = self.file.selections.get(&view).cloned() else {
+            self.status = "Select a row to delete".into();
+            return;
+        };
+        let entity = self.spec(&view).map(|spec| spec.entity.clone()).unwrap_or_default();
+        if id.starts_with("new:") {
+            self.drafts.remove(&draft_key(&entity, &id));
+            self.file.selections.remove(&view);
+            self.editing = None;
+            self.draft_rev = self.draft_rev.wrapping_add(1);
+            self.status = "Discarded the new row".into();
+            return;
+        }
+        let label = self.backend.label(&entity, &id);
+        self.pending_delete = Some((entity, id, label));
+        self.status = "Confirm delete to remove this record.".into();
+    }
+
+    pub fn confirm_delete(&mut self) {
+        let Some((entity, id, label)) = self.pending_delete.take() else {
+            self.status = "Nothing is waiting to be deleted".into();
+            return;
+        };
+        if let Some(embedded) = self.backend.model().entity(&entity).and_then(|entry| entry.embedded_in.clone()) {
+            let Some((parent_id, field, index)) = idmc_model::split_child_id(&id) else {
+                self.status = "child row id is not usable".into();
+                return;
+            };
+            let Some(mut parent) = self
+                .drafts
+                .get(&draft_key(&embedded.parent, &parent_id))
+                .cloned()
+                .or_else(|| self.backend.record(&embedded.parent, &parent_id))
+            else {
+                self.status = "The parent record is not loaded".into();
+                return;
+            };
+            if !idmc_model::remove_child(&mut parent, &field, index) {
+                self.status = "That child row is already gone".into();
+                return;
+            }
+            self.remember_draft(parent.clone());
+            if let Err(err) = self.write_record(parent) {
+                self.status = err;
+                return;
+            }
+            self.draft_rev = self.draft_rev.wrapping_add(1);
+            self.status = format!("Deleted {label}");
+            return;
+        }
+        let before = self.backend.record(&entity, &id);
+        let result = self.backend.submit_write(WriteOp {
+            kind: WriteKind::Delete,
+            entity: entity.clone(),
+            id: id.clone(),
+            source_system: idmc_model::DEFAULT_SOURCE_SYSTEM.into(),
+            source_pkey: String::new(),
+            values: std::collections::BTreeMap::new(),
+            before,
+        });
+        match result {
+            Ok(_) => {
+                self.drafts.remove(&draft_key(&entity, &id));
+                self.file.selections.retain(|_, value| value != &id);
+                self.draft_rev = self.draft_rev.wrapping_add(1);
+                self.status = format!("Deleted {label}");
+            }
+            Err(err) => self.status = err.to_string(),
+        }
+    }
+
+    pub fn cancel_delete(&mut self) {
+        self.pending_delete = None;
+        self.status = "Delete cancelled".into();
+    }
+
+    fn absorb_writes(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(note) = self.backend.take_write_notice() {
+            changed = true;
+            if let Some(message) = note.error {
+                if let Some(record) = note.restore {
+                    self.remember_draft(record);
+                }
+                self.status = format!("Save failed: {message}");
+            } else {
+                if let Some(to) = note.to_id.as_deref() {
+                    self.retarget_id(&note.from_id, to);
+                }
+                if let Some(message) = note.message {
+                    self.status = message;
+                }
+            }
+        }
+        changed
     }
 
     pub fn save(&self) -> Result<String, String> {
@@ -1523,6 +2123,10 @@ fn finish_session(
     Ok(session)
 }
 
+fn draft_key(entity: &str, id: &str) -> String {
+    format!("{entity}\0{id}")
+}
+
 fn sibling(path: &Path, name: &str) -> PathBuf {
     path.parent().unwrap_or(Path::new(".")).join(name)
 }
@@ -1642,6 +2246,106 @@ mod tests {
         session.perform("workspace.close");
         session.perform("workspace.close");
         assert_eq!(session.file.tabs.len(), 1);
+    }
+
+    #[test]
+    fn inline_edit_saves_creates_a_child_and_deletes() {
+        let backend = AppBackend::Mock(MockBackend::open_default().unwrap());
+        let file = default_workspace(backend.model());
+        let mut session = Session::boot(backend, file, PathBuf::from("workspace.json"), None);
+        session.reconcile();
+        session.file.focus = Some("table-c360.person".into());
+        let people = session.rows("table-c360.person");
+        let first = people[0].id.clone();
+        let original = session.backend.record("c360.person", &first).unwrap().values.get("firstName").cloned();
+        session.select("table-c360.person", &first);
+        session.begin_edit("table-c360.person", &first, "firstName");
+        session.editing.as_mut().unwrap().edit.select_all();
+        for ch in "Ada".chars() {
+            session.edit_insert(ch);
+        }
+        assert!(session.commit_edit(EditMove::Stay));
+        assert!(session.dirty_records());
+        session.revert_records();
+        assert!(!session.dirty_records());
+        assert_eq!(session.backend.record("c360.person", &first).unwrap().values.get("firstName"), original.as_ref());
+
+        session.begin_edit("table-c360.person", &first, "firstName");
+        session.editing.as_mut().unwrap().edit.select_all();
+        for ch in "Ada".chars() {
+            session.edit_insert(ch);
+        }
+        assert!(session.commit_edit(EditMove::Stay));
+        session.save_records();
+        assert_eq!(
+            session.backend.record("c360.person", &first).unwrap().values.get("firstName"),
+            Some(&FieldValue::String("Ada".into()))
+        );
+        assert!(!session.dirty_records());
+
+        session.file.focus = Some("table-c360.person".into());
+        session.perform("record.new");
+        let new_id = session.file.selections.get("table-c360.person").cloned().unwrap();
+        assert!(new_id.starts_with("new:"));
+        let definition = session.backend.model().entity("c360.person").unwrap().clone();
+        for field in definition.fields.iter().filter(|field| field.mandatory && field.ty != FieldType::Group && !field.many && !field.system) {
+            session.begin_edit("table-c360.person", &new_id, &field.id);
+            let sample = match field.ty {
+                FieldType::Integer => "1".to_string(),
+                FieldType::Decimal => "1.5".to_string(),
+                FieldType::Boolean => "true".to_string(),
+                FieldType::Date => "2024-01-02".to_string(),
+                FieldType::DateTime => "2024-01-02T00:00:00".to_string(),
+                FieldType::Lookup => session.editing.as_ref().and_then(|edit| edit.choices.first().map(|(_, label)| label.clone())).unwrap_or_else(|| "X".into()),
+                _ => "Bo".into(),
+            };
+            session.editing.as_mut().unwrap().edit.select_all();
+            for ch in sample.chars() {
+                session.edit_insert(ch);
+            }
+            assert!(session.commit_edit(EditMove::Stay), "{}", session.status);
+        }
+        session.save_records();
+        assert_eq!(session.status, "Saved", "{}", session.status);
+        let created = session.file.selections.get("table-c360.person").cloned().unwrap();
+        assert!(session.backend.record("c360.person", &created).is_some());
+
+        session.select("table-c360.person", &first);
+        session.file.focus = Some("table-c360.person.PostalAddress".into());
+        let before = session.rows("table-c360.person.PostalAddress").len();
+        session.new_child();
+        assert!(session.rows("table-c360.person.PostalAddress").len() > before);
+        let child_id = session.file.selections.get("table-c360.person.PostalAddress").cloned().unwrap();
+        let child = session.backend.model().entity("c360.person.PostalAddress").unwrap().clone();
+        for field in child.fields.iter().filter(|field| field.mandatory && field.ty != FieldType::Group && !field.many && !field.system) {
+            session.begin_edit("table-c360.person.PostalAddress", &child_id, &field.id);
+            let sample = match field.ty {
+                FieldType::Lookup => session
+                    .editing
+                    .as_ref()
+                    .and_then(|edit| edit.choices.first().map(|(_, label)| label.clone()))
+                    .unwrap_or_else(|| "SE".into()),
+                FieldType::Integer => "1".into(),
+                FieldType::Boolean => "true".into(),
+                FieldType::Date => "2024-01-02".into(),
+                _ => "Main street".into(),
+            };
+            session.editing.as_mut().unwrap().edit.select_all();
+            for ch in sample.chars() {
+                session.edit_insert(ch);
+            }
+            assert!(session.commit_edit(EditMove::Stay), "{}", session.status);
+        }
+        session.save_records();
+        assert_eq!(session.status, "Saved", "{}", session.status);
+        assert!(session.backend.related("c360.person.PostalAddress#items", &first).unwrap().len() > before);
+
+        session.file.focus = Some("table-c360.person".into());
+        session.select("table-c360.person", &created);
+        session.ask_delete();
+        assert!(session.pending_delete.is_some());
+        session.confirm_delete();
+        assert!(session.backend.record("c360.person", &created).is_none());
     }
 }
 

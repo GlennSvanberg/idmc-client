@@ -39,6 +39,11 @@ pub static ACTIONS: &[Action] = &[
     Action { id: "view.unlink", title: "Clear source link", shortcut: None },
     Action { id: "selection.next", title: "Select next row", shortcut: Some("down") },
     Action { id: "selection.prev", title: "Select previous row", shortcut: Some("up") },
+    Action { id: "record.new", title: "New record", shortcut: None },
+    Action { id: "record.new_child", title: "New child row", shortcut: None },
+    Action { id: "record.save", title: "Save record changes", shortcut: None },
+    Action { id: "record.revert", title: "Revert record changes", shortcut: None },
+    Action { id: "record.delete", title: "Delete record", shortcut: None },
 ];
 
 pub fn registry() -> &'static [Action] {

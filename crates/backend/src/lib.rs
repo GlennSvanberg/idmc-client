@@ -2,14 +2,14 @@
 //! loaded model plus a JSON record file. A live IDMC implementation can
 //! replace it later without changing views.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use idmc_model::{
-    compose_label, load_records, validate_values, value_at, Cardinality, FieldSide, FieldValue,
-    IdmcExportSource, JsonModelSource, ModelDefinition, ModelError, ModelSource, Record,
+    compose_label, load_records, validate_edit, validate_values, value_at, Cardinality, FieldSide,
+    FieldValue, IdmcExportSource, JsonModelSource, ModelDefinition, ModelError, ModelSource, Record,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +63,137 @@ pub trait Backend {
     /// Fetch the neighborhood of a graph node. In-flight calls for the same key are dropped.
     fn schedule_expand(&self, _key: &str) {}
     fn take_expand(&self) -> Option<idmc_model::Scene> { None }
+    /// Create, update, or delete one master record. Child rows are saved as part of the parent.
+    fn submit_write(&self, _op: WriteOp) -> Result<Record, BackendError> {
+        Err(BackendError::Message("this backend is read-only".into()))
+    }
+    /// A live write that failed after the optimistic update, or a server-assigned id.
+    fn take_write_notice(&self) -> Option<WriteNotice> { None }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteKind {
+    Create,
+    Update,
+    Delete,
+}
+
+#[derive(Clone, Debug)]
+pub struct WriteOp {
+    pub kind: WriteKind,
+    pub entity: String,
+    pub id: String,
+    pub source_system: String,
+    pub source_pkey: String,
+    pub values: BTreeMap<String, FieldValue>,
+    pub before: Option<Record>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WriteNotice {
+    pub error: Option<String>,
+    pub message: Option<String>,
+    pub entity: String,
+    pub from_id: String,
+    pub to_id: Option<String>,
+    pub restore: Option<Record>,
+}
+
+pub fn create_path(entity: &str, source_system: &str, source_pkey: &str) -> String {
+    format!(
+        "/business-entity/public/api/v1/entity/{entity}?sourceSystem={}&sourcePKey={}",
+        query_escape(source_system),
+        query_escape(source_pkey)
+    )
+}
+
+pub fn patch_path(entity: &str, id: &str, source_system: &str) -> String {
+    format!(
+        "/business-entity/public/api/v1/entity/{entity}/{id}?sourceSystem={}",
+        query_escape(source_system)
+    )
+}
+
+pub fn delete_path(entity: &str, id: &str, source_system: &str, source_pkey: Option<&str>) -> String {
+    let mut path = format!(
+        "/business-entity/public/api/v1/entity/{entity}/{id}?sourceSystem={}",
+        query_escape(source_system)
+    );
+    if let Some(pkey) = source_pkey.filter(|text| !text.is_empty()) {
+        path.push_str("&sourcePKey=");
+        path.push_str(&query_escape(pkey));
+    }
+    path
+}
+
+fn query_escape(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+pub fn apply_records(model: &ModelDefinition, records: &mut Vec<Record>, op: &WriteOp) -> Result<Record, BackendError> {
+    if op.source_system.is_empty() {
+        return Err(BackendError::Message("sourceSystem is required".into()));
+    }
+    if op.kind == WriteKind::Create && op.source_pkey.is_empty() {
+        return Err(BackendError::Message("sourcePKey is required".into()));
+    }
+    let entity = model
+        .entity(&op.entity)
+        .ok_or_else(|| BackendError::Message(format!("unknown entity {}", op.entity)))?;
+    if entity.embedded_in.is_some() {
+        return Err(BackendError::Message(
+            "save the parent record; child rows are part of it".into(),
+        ));
+    }
+    match op.kind {
+        WriteKind::Create => {
+            validate_edit(model, &op.entity, &op.values).map_err(|err| BackendError::Message(err.to_string()))?;
+            let id = if op.id.is_empty() || op.id.starts_with("new:") {
+                alloc_id(records, &op.entity)
+            } else if records.iter().any(|row| row.entity == op.entity && row.id == op.id) {
+                return Err(BackendError::Message(format!("{} {} already exists", op.entity, op.id)));
+            } else {
+                op.id.clone()
+            };
+            let record = Record { entity: op.entity.clone(), id, values: op.values.clone() };
+            records.push(record.clone());
+            Ok(record)
+        }
+        WriteKind::Update => {
+            validate_edit(model, &op.entity, &op.values).map_err(|err| BackendError::Message(err.to_string()))?;
+            let row = records
+                .iter_mut()
+                .find(|row| row.entity == op.entity && row.id == op.id)
+                .ok_or_else(|| BackendError::Message(format!("no {} record {}", op.entity, op.id)))?;
+            row.values = op.values.clone();
+            Ok(row.clone())
+        }
+        WriteKind::Delete => {
+            let pos = records
+                .iter()
+                .position(|row| row.entity == op.entity && row.id == op.id)
+                .ok_or_else(|| BackendError::Message(format!("no {} record {}", op.entity, op.id)))?;
+            Ok(records.remove(pos))
+        }
+    }
+}
+
+fn alloc_id(records: &[Record], entity: &str) -> String {
+    let mut n = records.iter().filter(|row| row.entity == entity).count() + 1;
+    loop {
+        let id = format!("local-{n}");
+        if !records.iter().any(|row| row.entity == entity && row.id == id) {
+            return id;
+        }
+        n += 1;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,12 +232,13 @@ struct MasterView {
 
 pub struct MockBackend {
     model: ModelDefinition,
-    records: Vec<Record>,
-    generation: u64,
+    records: RefCell<Vec<Record>>,
+    generation: Cell<u64>,
     lists: RefCell<ListCache>,
     view_state: RefCell<HashMap<String, MasterView>>,
     expand_inflight: RefCell<HashSet<String>>,
     expand_ready: RefCell<Vec<(String, idmc_model::Scene)>>,
+    source_keys: RefCell<HashMap<(String, String), (String, String)>>,
 }
 
 impl MockBackend {
@@ -124,12 +256,13 @@ impl MockBackend {
     fn with_records(model: ModelDefinition, records: Vec<Record>, generation: u64) -> Self {
         Self {
             model,
-            records,
-            generation,
+            records: RefCell::new(records),
+            generation: Cell::new(generation),
             lists: RefCell::new(ListCache::default()),
             view_state: RefCell::new(HashMap::new()),
             expand_inflight: RefCell::new(HashSet::new()),
             expand_ready: RefCell::new(Vec::new()),
+            source_keys: RefCell::new(HashMap::new()),
         }
     }
 
@@ -170,17 +303,18 @@ impl MockBackend {
 
     pub fn reload_data(&mut self, json: &str) -> Result<(), BackendError> {
         let records = load_records(json)?;
-        let trial = Self::with_records(self.model.clone(), records, self.generation);
+        let trial = Self::with_records(self.model.clone(), records, self.generation.get());
         trial.validate_dataset()?;
         self.records = trial.records;
-        self.generation = self.generation.wrapping_add(1);
+        self.generation.set(self.generation.get().wrapping_add(1));
         self.lists.borrow_mut().lists.clear();
         Ok(())
     }
 
     pub fn validate_dataset(&self) -> Result<(), BackendError> {
         let mut ids: BTreeMap<(&str, &str), ()> = BTreeMap::new();
-        for record in &self.records {
+        let records = self.records.borrow();
+        for record in records.iter() {
             let entity = self.model.entity(&record.entity).ok_or_else(|| {
                 BackendError::Message(format!("record {} has unknown entity {}", record.id, record.entity))
             })?;
@@ -198,9 +332,9 @@ impl MockBackend {
             }
             validate_values(&self.model, &record.entity, &record.values)?;
         }
-        for record in &self.records {
+        for record in records.iter() {
             let entity = self.model.entity(&record.entity).unwrap();
-            check_refs(&self.model, &self.records, entity, &record.values, &record.id)?;
+            check_refs(&self.model, &records, entity, &record.values, &record.id)?;
         }
         Ok(())
     }
@@ -209,7 +343,7 @@ impl MockBackend {
 
 impl MockBackend {
     fn cached(&self, key: &str, build: impl FnOnce() -> Vec<Record>) -> Arc<Vec<Record>> {
-        let generation = self.generation;
+        let generation = self.generation.get();
         {
             let mut slot = self.lists.borrow_mut();
             if slot.generation != generation {
@@ -246,9 +380,9 @@ impl Backend for MockBackend {
             None => format!("records\0{entity}"),
         };
         let model = &self.model;
-        let records = &self.records;
+        let records = self.records.borrow();
         self.cached(&key, || {
-            let mut rows = records_of(model, records, entity);
+            let mut rows = records_of(model, &records, entity);
             if let Some(view) = &view {
                 if let Some(field) = &view.sort_field {
                     let field = field.clone();
@@ -266,35 +400,37 @@ impl Backend for MockBackend {
             rows
         })
     }
-    fn record(&self, entity: &str, id: &str) -> Option<Record> { record_of(&self.model, &self.records, entity, id) }
-    fn label(&self, entity: &str, id: &str) -> String { label_of(&self.model, &self.records, entity, id) }
+    fn record(&self, entity: &str, id: &str) -> Option<Record> { record_of(&self.model, &self.records.borrow(), entity, id) }
+    fn label(&self, entity: &str, id: &str) -> String { label_of(&self.model, &self.records.borrow(), entity, id) }
     fn related(&self, relationship: &str, source_id: &str) -> Result<Vec<Record>, BackendError> {
         let key = format!("rel\0{relationship}\0{source_id}");
         {
             let slot = self.lists.borrow();
-            if slot.generation == self.generation {
+            if slot.generation == self.generation.get() {
                 if let Some(hit) = slot.lists.get(&key) {
                     return Ok(hit.as_ref().clone());
                 }
             }
         }
-        let rows = related_of(&self.model, &self.records, relationship, source_id)?;
+        let rows = related_of(&self.model, &self.records.borrow(), relationship, source_id)?;
         self.cached(&key, || rows.clone());
         Ok(rows)
     }
     fn hierarchy_roots(&self, entity: &str) -> Vec<Record> {
-        self.cached(&format!("roots\0{entity}"), || hierarchy_roots_of(&self.model, &self.records, entity))
+        let records = self.records.borrow();
+        self.cached(&format!("roots\0{entity}"), || hierarchy_roots_of(&self.model, &*records, entity))
             .as_ref()
             .clone()
     }
     fn hierarchy_children(&self, entity: &str, id: &str) -> Vec<Record> {
         self.cached(&format!("kids\0{entity}\0{id}"), || {
-            hierarchy_children_of(&self.model, &self.records, entity, id)
+            let held = self.records.borrow();
+            hierarchy_children_of(&self.model, &*held, entity, id)
         })
         .as_ref()
         .clone()
     }
-    fn generation(&self) -> u64 { self.generation }
+    fn generation(&self) -> u64 { self.generation.get() }
     fn master_total(&self, entity: &str) -> usize { self.shared_records(entity).len() }
     fn master_at(&self, entity: &str, index: usize) -> Option<Record> {
         self.shared_records(entity).get(index).cloned()
@@ -311,13 +447,13 @@ impl Backend for MockBackend {
         self.lists.borrow_mut().lists.clear();
     }
     fn search_records(&self, query: &str, limit: usize) -> Vec<SearchHit> {
-        search_local(&self.model, &self.records, query, limit)
+        search_local(&self.model, &self.records.borrow(), query, limit)
     }
     fn schedule_expand(&self, key: &str) {
         if !self.expand_inflight.borrow_mut().insert(key.to_string()) {
             return;
         }
-        let scene = idmc_model::expand_key(&self.model, &self.records, key);
+        let scene = idmc_model::expand_key(&self.model, &self.records.borrow(), key);
         if scene.nodes.is_empty() && scene.edges.is_empty() {
             self.expand_inflight.borrow_mut().remove(key);
             return;
@@ -333,6 +469,28 @@ impl Backend for MockBackend {
             self.expand_inflight.borrow_mut().remove(&key);
             Some(scene)
         }
+    }
+    fn submit_write(&self, mut op: WriteOp) -> Result<Record, BackendError> {
+        if op.source_pkey.is_empty() {
+            if let Some((_, pkey)) = self.source_keys.borrow().get(&(op.entity.clone(), op.id.clone())) {
+                op.source_pkey = pkey.clone();
+            }
+        }
+        let saved = {
+            let mut records = self.records.borrow_mut();
+            apply_records(&self.model, &mut records, &op)?
+        };
+        if op.kind == WriteKind::Create {
+            self.source_keys.borrow_mut().insert(
+                (saved.entity.clone(), saved.id.clone()),
+                (op.source_system, op.source_pkey),
+            );
+        }
+        if op.kind == WriteKind::Delete {
+            self.source_keys.borrow_mut().remove(&(op.entity, op.id));
+        }
+        self.generation.set(self.generation.get().wrapping_add(1));
+        Ok(saved)
     }
 }
 
@@ -475,7 +633,7 @@ pub(crate) fn label_text(model: &ModelDefinition, record: &Record) -> String {
     compose_label(entity, &record.values, model).unwrap_or_else(|| record.id.clone())
 }
 
-pub(crate) fn project_children(model: &ModelDefinition, parent: &Record, child_id: &str) -> Vec<Record> {
+pub fn project_children(model: &ModelDefinition, parent: &Record, child_id: &str) -> Vec<Record> {
     let Some(child) = model.entity(child_id) else { return Vec::new() };
     let Some(embedded) = &child.embedded_in else { return Vec::new() };
     let Some(value) = parent.values.get(&embedded.field) else { return Vec::new() };
@@ -753,6 +911,18 @@ impl Backend for AppBackend {
             AppBackend::Live(backend) => backend.take_expand(),
         }
     }
+    fn submit_write(&self, op: WriteOp) -> Result<Record, BackendError> {
+        match self {
+            AppBackend::Mock(backend) => backend.submit_write(op),
+            AppBackend::Live(backend) => backend.submit_write(op),
+        }
+    }
+    fn take_write_notice(&self) -> Option<WriteNotice> {
+        match self {
+            AppBackend::Mock(_) => None,
+            AppBackend::Live(backend) => backend.take_write_notice(),
+        }
+    }
 }
 
 fn text_at(record: &Record, field: &str) -> String {
@@ -891,5 +1061,71 @@ mod tests {
             backend.model().format_field(status, &value, &|e, id| backend.label(e, id)),
             "Active"
         );
+    }
+
+    #[test]
+    fn mock_creates_updates_and_deletes_in_memory() {
+        let backend = person();
+        let mut values = backend.record("c360.person", "p-anna").unwrap().values;
+        values.insert("firstName".into(), FieldValue::String("Ann".into()));
+        let updated = backend
+            .submit_write(WriteOp {
+                kind: WriteKind::Update,
+                entity: "c360.person".into(),
+                id: "p-anna".into(),
+                source_system: idmc_model::DEFAULT_SOURCE_SYSTEM.into(),
+                source_pkey: String::new(),
+                values,
+                before: None,
+            })
+            .unwrap();
+        assert_eq!(updated.values.get("firstName"), Some(&FieldValue::String("Ann".into())));
+        assert_eq!(backend.label("c360.person", "p-anna"), "Ann Lindström");
+        let created = backend
+            .submit_write(WriteOp {
+                kind: WriteKind::Create,
+                entity: "c360.person".into(),
+                id: "new:1".into(),
+                source_system: idmc_model::DEFAULT_SOURCE_SYSTEM.into(),
+                source_pkey: "pkey-1".into(),
+                values: backend.record("c360.person", "p-anna").unwrap().values,
+                before: None,
+            })
+            .unwrap();
+        assert!(created.id.starts_with("local-"));
+        assert!(backend.record("c360.person", &created.id).is_some());
+        backend
+            .submit_write(WriteOp {
+                kind: WriteKind::Delete,
+                entity: "c360.person".into(),
+                id: created.id.clone(),
+                source_system: idmc_model::DEFAULT_SOURCE_SYSTEM.into(),
+                source_pkey: "pkey-1".into(),
+                values: BTreeMap::new(),
+                before: None,
+            })
+            .unwrap();
+        assert!(backend.record("c360.person", &created.id).is_none());
+        let missing = backend.submit_write(WriteOp {
+            kind: WriteKind::Create,
+            entity: "c360.person".into(),
+            id: "new:2".into(),
+            source_system: String::new(),
+            source_pkey: "pkey-2".into(),
+            values: BTreeMap::new(),
+            before: None,
+        });
+        assert!(missing.unwrap_err().to_string().contains("sourceSystem"));
+        let path = create_path("c360.person", "c360.default.system", "pkey 1");
+        assert!(path.contains("sourceSystem=c360.default.system"));
+        assert!(path.contains("sourcePKey=pkey%201"));
+        let patch = patch_path("c360.person", "MDM1", "c360.default.system");
+        assert_eq!(
+            patch,
+            "/business-entity/public/api/v1/entity/c360.person/MDM1?sourceSystem=c360.default.system"
+        );
+        let delete = delete_path("c360.person", "MDM1", "c360.default.system", Some("SFDC_566"));
+        assert!(delete.contains("sourceSystem=c360.default.system"));
+        assert!(delete.contains("sourcePKey=SFDC_566"));
     }
 }

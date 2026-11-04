@@ -8,6 +8,7 @@ mod graph;
 mod idmc;
 mod types;
 mod value;
+mod write;
 
 pub use graph::{
     build_entity_scene, build_model_scene, build_record_fields, expand_key, node_mark, radius_for, stub_entity,
@@ -17,6 +18,10 @@ pub use graph::{
 pub use idmc::IdmcExportSource;
 pub use types::*;
 pub use value::{value_at, FieldValue, Record};
+pub use write::{
+    api_body, child_record_id, edit_text, lookup_choices, parse_field, patch_ops, push_child, read_field,
+    remove_child, set_child_field, split_child_id, validate_edit, DEFAULT_SOURCE_SYSTEM,
+};
 
 /// Something that can produce a [`ModelDefinition`]. IDMC export packages and
 /// hand-written JSON files both sit behind this so a later source (a live

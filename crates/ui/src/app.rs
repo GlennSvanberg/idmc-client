@@ -181,6 +181,11 @@ impl Root {
         if table {
             items.push(item("Field chooser", "Ctrl+Alt+C", MenuCommand::Run("view.fields")));
         }
+        items.push(item("New record", "", MenuCommand::Run("record.new")));
+        items.push(item("New child row", "", MenuCommand::Run("record.new_child")));
+        items.push(item("Save changes", "", MenuCommand::Run("record.save")));
+        items.push(item("Revert changes", "", MenuCommand::Run("record.revert")));
+        items.push(item("Delete record", "", MenuCommand::Run("record.delete")));
         items.push(item("Show in graph", "", MenuCommand::Run("record.show_in_graph")));
         items.push(item("Choose source link", "Ctrl+Alt+L", MenuCommand::Run("view.link")));
         items.push(item("Clear source link", "", MenuCommand::Run("view.unlink")));
@@ -197,6 +202,10 @@ impl Root {
         let key = event.keystroke.key.to_ascii_lowercase();
         let mods = &event.keystroke.modifiers;
         let editing = self.session.palette.open || self.session.chooser_for.is_some() || self.session.filter_for.is_some() || self.session.graph_query;
+        if self.session.editing.is_some() && !editing {
+            self.on_cell_key(&key, mods, event, cx);
+            return;
+        }
         if !editing && self.session.graph_focused() {
             let plain = !mods.control && !mods.alt && !mods.platform && !mods.shift;
             let effect = match key.as_str() {
@@ -291,6 +300,54 @@ impl Root {
             cx.stop_propagation();
             cx.notify();
         }
+    }
+
+    fn on_cell_key(&mut self, key: &str, mods: &gpui::Modifiers, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if mods.control || mods.platform || mods.alt {
+            return;
+        }
+        let shift = mods.shift;
+        let choices = self.session.editing.as_ref().is_some_and(|edit| !edit.choices.is_empty());
+        match key {
+            "escape" => self.session.cancel_edit(),
+            "enter" => {
+                self.session.commit_edit(crate::session::EditMove::Down);
+            }
+            "tab" => {
+                let next = if shift {
+                    crate::session::EditMove::PrevField
+                } else {
+                    crate::session::EditMove::NextField
+                };
+                self.session.commit_edit(next);
+            }
+            "backspace" => self.session.edit_backspace(),
+            "delete" | "forwarddelete" => self.session.edit_delete_forward(),
+            "left" => self.session.edit_left(shift),
+            "right" => self.session.edit_right(shift),
+            "home" => self.session.edit_home(shift),
+            "end" => self.session.edit_end(shift),
+            "up" if choices => self.session.cycle_choice(-1),
+            "down" if choices => self.session.cycle_choice(1),
+            "up" => {
+                self.session.commit_edit(crate::session::EditMove::Up);
+            }
+            "down" => {
+                self.session.commit_edit(crate::session::EditMove::Down);
+            }
+            "space" => self.session.edit_insert(' '),
+            _ => {
+                if let Some(text) = &event.keystroke.key_char {
+                    if let Some(ch) = text.chars().next() {
+                        if text.chars().count() == 1 && !ch.is_control() {
+                            self.session.edit_insert(ch);
+                        }
+                    }
+                }
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn render_palette(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -516,6 +573,7 @@ impl Render for Root {
             .child(self.chrome(&summary, &theme, cx))
             .child(self.workspace_bar(&theme, cx))
             .child(div().flex_1().min_h_0().p_2().child(surface))
+            .children(self.confirm_bar(&theme, cx))
             .child(self.status_bar(&theme));
         if let Some(palette) = palette {
             root = root.child(palette);
@@ -601,6 +659,9 @@ impl Root {
             )
             .child(div().text_size(px(11.)).text_color(rgb(theme.muted)).child(summary.to_string()))
             .child(div().flex_1())
+            .when(self.session.dirty_records(), |row| {
+                row.child(div().w(px(8.)).h(px(8.)).rounded_full().bg(rgb(theme.accent)))
+            })
             .child(
                 div()
                     .id("theme-toggle")
@@ -627,7 +688,58 @@ impl Root {
             )
     }
 
+    fn confirm_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (_, _, label) = self.session.pending_delete.clone()?;
+        Some(
+            div()
+                .h(px(36.))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .bg(rgb(theme.raised))
+                .border_t_1()
+                .border_color(rgb(theme.border))
+                .text_size(px(12.))
+                .child(format!("Delete {label}?"))
+                .child(
+                    div()
+                        .id("confirm-delete")
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .bg(rgb(theme.accent))
+                        .text_color(rgb(theme.on_accent))
+                        .child("Delete")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.exec("record.delete_confirm", cx))),
+                )
+                .child(
+                    div()
+                        .id("cancel-delete")
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .child("Cancel")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.session.cancel_delete();
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
+
     fn status_bar(&self, theme: &Theme) -> impl IntoElement {
+        let dirty = self.session.dirty_records();
+        let text = if dirty && self.session.status.is_empty() {
+            "Unsaved changes".to_string()
+        } else if dirty {
+            format!("Unsaved changes · {}", self.session.status)
+        } else {
+            self.session.status.clone()
+        };
         div()
             .h(px(26.))
             .px_3()
@@ -637,8 +749,8 @@ impl Root {
             .border_t_1()
             .border_color(rgb(theme.border))
             .text_size(px(11.))
-            .text_color(rgb(theme.muted))
-            .child(self.session.status.clone())
+            .text_color(rgb(if dirty { theme.accent } else { theme.muted }))
+            .child(text)
     }
 }
 

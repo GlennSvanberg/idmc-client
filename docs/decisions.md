@@ -62,6 +62,6 @@ The graph is a GPUI canvas, not a port of the Braian TypeScript. Force parameter
 * Promoting every `allowMany` group to a child entity is the linking model. A group that should stay an inline editor, rather than its own table, is not distinguished yet.
 * Inverse relationships are derived from reference fields. If the export later contains explicit relationships, those should win and the derived inverse should not be duplicated.
 * Workspace path is the working directory. A user config directory may be a better default once more than one model is in daily use.
-* Editing and write-back are out of scope. The client is read-only.
+* Record edits are saved through the Business 360 entity API. Create is `POST /business-entity/public/api/v1/entity/{entity}?sourceSystem&sourcePKey`. Field changes are `PATCH` on `.../entity/{entity}/{businessId}?sourceSystem`. Delete is `DELETE` on that record with `sourceSystem`, and `sourcePKey` when the row has one. Child rows are part of the parent payload. The mock backend applies the same operations in memory. A live call updates the screen immediately and rolls the row back if the request fails.
 * Localized text other than `en` is ignored. This export only has English.
 * Custom fields (Supplier `X_…` in the Item package) are kept as ordinary fields. No special case.
