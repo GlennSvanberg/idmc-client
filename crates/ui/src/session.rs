@@ -188,6 +188,8 @@ pub struct LookupRow {
     pub label: String,
     pub checked: bool,
     pub clear: bool,
+    /// Typed text that matches no known code. The label is the text to commit.
+    pub free: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1901,7 +1903,7 @@ impl Session {
             }
         }
         let choices = self.menu_choices(&field, &text);
-        let lookup = field.ty == FieldType::Lookup && !choices.is_empty();
+        let lookup = field.ty == FieldType::Lookup && field.lookup.is_some();
         let mut edit = TextEdit::new();
         for ch in text.chars() {
             edit.insert(ch);
@@ -1944,7 +1946,8 @@ impl Session {
         } else {
             Vec::new()
         };
-        lookup_menu_values(self.backend.is_live(), closed, sample, seen, current)
+        let tenant = self.backend.tenant_codes(id);
+        lookup_menu_values(closed, sample, seen, tenant, current)
     }
 
     fn lookup_display_name(&self, field: &FieldDef, value: &FieldValue) -> Option<String> {
@@ -2005,40 +2008,75 @@ impl Session {
         let Some(definition) = self.backend.model().entity(&spec.entity).and_then(|entity| entity.field(field)) else {
             return false;
         };
-        definition.ty == FieldType::Lookup && !self.menu_choices(definition, "").is_empty()
+        definition.ty == FieldType::Lookup && definition.lookup.is_some()
     }
 
     pub fn lookup_rows(&self) -> Vec<LookupRow> {
-        let Some(edit) = &self.editing else { return Vec::new() };
-        if !edit.lookup {
+        let Some((query, typed, required, committed, entity, field_id, fallback, closed)) = self.lookup_query() else {
             return Vec::new();
-        }
-        let query = if edit.edit.selection() == Some((0, edit.edit.len_chars())) {
-            String::new()
-        } else {
-            edit.edit.text.trim().to_ascii_lowercase()
         };
+        let choices = self
+            .backend
+            .model()
+            .entity(&entity)
+            .and_then(|entry| entry.field(&field_id))
+            .map(|field| self.menu_choices(field, &committed))
+            .unwrap_or(fallback);
         let mut rows = Vec::new();
-        if !edit.required {
+        if !required {
             rows.push(LookupRow {
                 code: String::new(),
                 label: "Clear".into(),
-                checked: edit.committed.trim().is_empty(),
+                checked: committed.trim().is_empty(),
                 clear: true,
+                free: false,
             });
         }
-        for (code, label) in &edit.choices {
+        for (code, label) in &choices {
             if !lookup_hit(label, code, &query) {
                 continue;
             }
             rows.push(LookupRow {
                 code: code.clone(),
                 label: label.clone(),
-                checked: label.eq_ignore_ascii_case(&edit.committed) || code.eq_ignore_ascii_case(&edit.committed),
+                checked: label.eq_ignore_ascii_case(&committed) || code.eq_ignore_ascii_case(&committed),
                 clear: false,
+                free: false,
+            });
+        }
+        if !query.is_empty() && !closed && !rows.iter().any(|row| !row.clear) {
+            rows.push(LookupRow {
+                code: typed.clone(),
+                label: typed,
+                checked: false,
+                clear: false,
+                free: true,
             });
         }
         rows
+    }
+
+    fn lookup_query(&self) -> Option<(String, String, bool, String, String, String, Vec<(String, String)>, bool)> {
+        let edit = self.editing.as_ref()?;
+        if !edit.lookup {
+            return None;
+        }
+        let full_selection = edit.edit.selection() == Some((0, edit.edit.len_chars()));
+        let typed = edit.edit.text.trim().to_string();
+        let query = if full_selection { String::new() } else { typed.to_ascii_lowercase() };
+        let closed = edit.lookup_id.as_deref().is_some_and(|id| {
+            self.backend.model().lookup(id).is_some_and(|lookup| lookup.closed)
+        });
+        Some((
+            query,
+            typed,
+            edit.required,
+            edit.committed.clone(),
+            edit.entity.clone(),
+            edit.field.clone(),
+            edit.choices.clone(),
+            closed,
+        ))
     }
 
     pub fn move_lookup(&mut self, delta: i32) {
@@ -2058,32 +2096,47 @@ impl Session {
             return false;
         }
         let typed = self.editing.as_ref().map(|edit| edit.edit.text.trim().to_string()).unwrap_or_default();
+        let query = if self.editing.as_ref().is_some_and(|edit| edit.edit.selection() == Some((0, edit.edit.len_chars()))) {
+            String::new()
+        } else {
+            typed.to_ascii_lowercase()
+        };
         let closed = self.editing.as_ref().and_then(|edit| {
             let id = edit.lookup_id.as_deref()?;
             Some(self.backend.model().lookup(id).is_some_and(|lookup| lookup.closed))
         }).unwrap_or(false);
-        let only_clear = !rows.is_empty() && rows.iter().all(|row| row.clear);
-        if rows.is_empty() || (only_clear && !typed.is_empty()) {
-            if closed {
-                self.status = "No matching value".into();
-                if let Some(edit) = self.editing.as_mut() {
-                    edit.error = Some(self.status.clone());
-                }
-                return false;
+        let index = self.editing.as_ref().map(|edit| edit.choice_at).unwrap_or(0).min(rows.len().saturating_sub(1));
+        let row = rows.get(index).cloned();
+        let any_known = rows.iter().any(|item| !item.clear && !item.free && lookup_hit(&item.label, &item.code, &query));
+        let label = if let Some(row) = row.as_ref() {
+            if !row.clear && !row.free && (query.is_empty() || lookup_hit(&row.label, &row.code, &query)) {
+                Some(row.label.clone())
+            } else if row.free || (!closed && !typed.is_empty() && !any_known) {
+                Some(typed.clone())
+            } else if row.clear {
+                Some(String::new())
+            } else if closed {
+                None
+            } else {
+                Some(typed.clone())
             }
-            return self.commit_edit(EditMove::Stay);
-        }
-        let Some(row) = rows.get(self.editing.as_ref().map(|edit| edit.choice_at).unwrap_or(0).min(rows.len().saturating_sub(1))).cloned() else {
+        } else if !closed && !typed.is_empty() {
+            Some(typed.clone())
+        } else {
+            None
+        };
+        let Some(label) = label else {
             self.status = "No matching value".into();
             if let Some(edit) = self.editing.as_mut() {
                 edit.error = Some(self.status.clone());
             }
             return false;
         };
-        let label = if row.clear { String::new() } else { row.label.clone() };
-        if !row.clear {
-            if let Some(id) = self.editing.as_ref().and_then(|edit| edit.lookup_id.clone()) {
-                self.note_lookup(&id, &row.code, &row.label);
+        if let Some(row) = row {
+            if !row.clear && !row.free && label == row.label {
+                if let Some(id) = self.editing.as_ref().and_then(|edit| edit.lookup_id.clone()) {
+                    self.note_lookup(&id, &row.code, &row.label);
+                }
             }
         }
         if let Some(edit) = self.editing.as_mut() {
@@ -2791,29 +2844,32 @@ fn include_current(mut rows: Vec<(String, String)>, current: &str) -> Vec<(Strin
     rows
 }
 
-/// Live menus use values seen on tenant records. An empty result is a free-text
-/// editor so the sample file is not offered as the catalog. A closed list is
-/// the model. Mock mode keeps the sample list and the current value.
+/// Options are the union of the tenant code list, codes seen on loaded
+/// records, and the model reference values. A closed list is the model.
+/// An empty union still opens the menu; the view says there are no known values.
 pub fn lookup_menu_values(
-    live: bool,
     closed: bool,
     sample: Vec<(String, String)>,
     seen: Vec<(String, String)>,
+    tenant: Vec<(String, String)>,
     current: &str,
 ) -> Vec<(String, String)> {
     if closed && !sample.is_empty() {
         return include_current(sample, current);
     }
-    if live {
-        if seen.is_empty() {
-            return Vec::new();
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for source in [tenant, seen, sample] {
+        for (code, label) in source {
+            if code.is_empty() {
+                continue;
+            }
+            if rows.iter().any(|(have, _)| have.eq_ignore_ascii_case(&code)) {
+                continue;
+            }
+            rows.push((code, label));
         }
-        return include_current(seen, current);
     }
-    if sample.is_empty() {
-        return Vec::new();
-    }
-    include_current(sample, current)
+    include_current(rows, current)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3339,6 +3395,21 @@ mod tests {
             &session.drafts.values().find(|row| row.id == person.id).cloned().unwrap(),
         );
         assert!(cleared.is_empty(), "{cleared}");
+        session.begin_edit("table-c360.person", &person.id, "gender");
+        assert!(session.editing.as_ref().is_some_and(|edit| edit.lookup));
+        for ch in ['z', 'z', 'z'] {
+            session.edit_insert(ch);
+        }
+        let typed = session.lookup_rows();
+        assert!(typed.iter().any(|row| row.free && row.code == "zzz"), "{typed:?}");
+        assert!(typed.iter().all(|row| row.label != "Male"), "{typed:?}");
+        assert!(session.confirm_lookup());
+        let written = session.cell(
+            "c360.person",
+            "gender",
+            &session.drafts.values().find(|row| row.id == person.id).cloned().unwrap(),
+        );
+        assert_eq!(written, "zzz");
     }
 
     #[test]
@@ -3374,17 +3445,19 @@ mod tests {
     fn lookup_menu_uses_seen_tenant_values_and_keeps_free_text() {
         let sample = vec![("SE-AB".into(), "Stockholm".into()), ("US-CA".into(), "California".into())];
         let seen = vec![("SD".into(), "South Dakota".into()), ("NE".into(), "Nebraska".into())];
-        let live = lookup_menu_values(true, false, sample.clone(), seen, "South Dakota");
+        let live = lookup_menu_values(false, sample.clone(), seen, Vec::new(), "South Dakota");
         assert!(live.iter().any(|(code, label)| code == "SD" && label == "South Dakota"), "{live:?}");
-        assert!(live.iter().all(|(code, _)| code != "SE-AB" && code != "US-CA"), "{live:?}");
-        let free = lookup_menu_values(true, false, sample.clone(), Vec::new(), "South Dakota");
-        assert!(free.is_empty(), "{free:?}");
-        let mock = lookup_menu_values(false, false, sample.clone(), Vec::new(), "South Dakota");
-        assert!(mock.iter().any(|(_, label)| label == "South Dakota"), "{mock:?}");
-        assert!(mock.iter().any(|(_, label)| label == "California"), "{mock:?}");
-        let closed = lookup_menu_values(true, true, sample, Vec::new(), "Utah");
+        assert!(live.iter().any(|(code, _)| code == "SE-AB"), "{live:?}");
+        assert!(live.iter().any(|(code, _)| code == "US-CA"), "{live:?}");
+        let free = lookup_menu_values(false, sample.clone(), Vec::new(), Vec::new(), "South Dakota");
+        assert!(free.iter().any(|(_, label)| label == "Stockholm"), "{free:?}");
+        assert!(free.iter().any(|(_, label)| label == "South Dakota"), "{free:?}");
+        let tenant = lookup_menu_values(false, sample.clone(), Vec::new(), vec![("UT".into(), "Utah".into())], "");
+        assert!(tenant.iter().any(|(code, label)| code == "UT" && label == "Utah"), "{tenant:?}");
+        assert!(tenant.iter().any(|(_, label)| label == "California"), "{tenant:?}");
+        let closed = lookup_menu_values(true, sample, Vec::new(), vec![("UT".into(), "Utah".into())], "");
         assert!(closed.iter().any(|(_, label)| label == "Stockholm"));
-        assert!(closed.iter().any(|(_, label)| label == "Utah"));
+        assert!(closed.iter().all(|(_, label)| label != "Utah"));
     }
 
     #[test]

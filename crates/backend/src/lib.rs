@@ -41,6 +41,8 @@ pub trait Backend {
     /// Code/name pairs seen on live records for one code list. Empty when the
     /// tenant catalog has not been observed. The sample file is not this list.
     fn lookup_catalog(&self, _lookup: &str) -> Vec<(String, String)> { Vec::new() }
+    /// Code/name pairs from a Reference 360 code list, when that call succeeds.
+    fn tenant_codes(&self, _lookup: &str) -> Vec<(String, String)> { Vec::new() }
     /// Bumps when the record set changes. Views cache sorts against this.
     fn generation(&self) -> u64 { 0 }
     /// Sorted records for one entity, shared until `generation` changes.
@@ -873,6 +875,12 @@ impl Backend for AppBackend {
         match self {
             AppBackend::Mock(_) => Vec::new(),
             AppBackend::Live(backend) => backend.lookup_catalog(lookup),
+        }
+    }
+    fn tenant_codes(&self, lookup: &str) -> Vec<(String, String)> {
+        match self {
+            AppBackend::Mock(_) => Vec::new(),
+            AppBackend::Live(backend) => backend.tenant_codes(lookup),
         }
     }
     fn generation(&self) -> u64 {

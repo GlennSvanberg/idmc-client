@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use idmc_model::{
     api_body, changed_labels, expand_key, patch_ops, FieldDef, FieldType, FieldValue, GraphEdge, IdmcExportSource,
-    JsonModelSource, ModelDefinition, ModelSource, NodeId, Record, Scene,
+    JsonModelSource, Lookup, ModelDefinition, ModelSource, NodeId, Record, Scene,
 };
 use serde_json::{Map, Value};
 
@@ -154,6 +154,10 @@ struct Hub {
     /// nothing", which is different from not having searched yet.
     search_seen: BTreeSet<String>,
     search_fields: HashMap<String, BTreeSet<String>>,
+    /// Reference 360 code/name pairs keyed by the model lookup id.
+    code_lists: HashMap<String, Vec<(String, String)>>,
+    code_lists_done: bool,
+    code_lists_inflight: bool,
 }
 
 #[derive(Clone)]
@@ -311,6 +315,9 @@ impl LiveBackend {
                 expand_ready: Vec::new(),
                 search_seen: BTreeSet::new(),
                 search_fields: HashMap::new(),
+                code_lists: HashMap::new(),
+                code_lists_done: false,
+                code_lists_inflight: false,
             }),
         });
         let backend = Self { model, roots, shared };
@@ -557,6 +564,34 @@ impl LiveBackend {
         let set = hub.search_fields.get(entity).cloned().unwrap_or_default();
         drop(hub);
         Some(order_search_fields(&self.model, entity, &set))
+    }
+
+    /// Codes from `POST /rdm-service/external/v2/search`. The first call starts
+    /// the request. A failure leaves the map empty and is not retried.
+    pub fn tenant_codes(&self, lookup: &str) -> Vec<(String, String)> {
+        self.ensure_code_lists();
+        lock(&self.shared.hub).code_lists.get(lookup).cloned().unwrap_or_default()
+    }
+
+    fn ensure_code_lists(&self) {
+        {
+            let mut hub = lock(&self.shared.hub);
+            if hub.code_lists_done || hub.code_lists_inflight {
+                return;
+            }
+            hub.code_lists_inflight = true;
+        }
+        let shared = Arc::clone(&self.shared);
+        let model = Arc::clone(&self.model);
+        if std::thread::Builder::new()
+            .name("idmc-codes".into())
+            .spawn(move || fetch_code_lists(shared, model))
+            .is_err()
+        {
+            let mut hub = lock(&self.shared.hub);
+            hub.code_lists_inflight = false;
+            hub.code_lists_done = true;
+        }
     }
 
     pub fn set_master_view(&self, entity: &str, query: &str, sort_field: Option<&str>, descending: bool) {
@@ -1990,6 +2025,110 @@ fn collect_search_fields(
     }
 }
 
+struct CodeHit {
+    code: String,
+    name: String,
+    list_id: String,
+    list_name: String,
+    set_name: String,
+}
+
+fn fetch_code_lists(shared: Arc<Shared>, model: Arc<ModelDefinition>) {
+    let Some(base) = shared.http.mdm_base() else {
+        let mut hub = lock(&shared.hub);
+        hub.code_lists_inflight = false;
+        return;
+    };
+    let url = format!("{base}/rdm-service/external/v2/search?showAssetDetails=true");
+    let mut rows = Vec::new();
+    for page in 0..5 {
+        let body = serde_json::json!({ "page": page, "pageSize": 1000, "search": "*" });
+        let Ok(value) = shared.http.post_json(&url, &body) else { break };
+        let (last, batch) = parse_r360_page(&value);
+        let empty = batch.is_empty();
+        rows.extend(batch);
+        if last || empty {
+            break;
+        }
+    }
+    let assigned = assign_code_lists(&model, &rows);
+    {
+        let mut hub = lock(&shared.hub);
+        hub.code_lists = assigned;
+        hub.code_lists_inflight = false;
+        hub.code_lists_done = true;
+    }
+    publish(&shared, true);
+}
+
+fn parse_r360_page(body: &Value) -> (bool, Vec<CodeHit>) {
+    let last = body.get("lastPage").and_then(|v| v.as_bool()).unwrap_or(true);
+    let Some(content) = body.get("content").and_then(|v| v.as_array()) else {
+        return (true, Vec::new());
+    };
+    let mut rows = Vec::new();
+    for item in content {
+        let record = item.get("record").unwrap_or(item);
+        let fields = record.get("codeValueFields").unwrap_or(record);
+        let code = json_text(fields, "Code");
+        if code.is_empty() {
+            continue;
+        }
+        let name = {
+            let name = json_text(fields, "Name");
+            if name.is_empty() { code.clone() } else { name }
+        };
+        let list = item.get("codeListDetails");
+        let set = item.get("referenceDataSetDetails");
+        rows.push(CodeHit {
+            code,
+            name,
+            list_id: list.map(|value| json_text(value, "id")).unwrap_or_default(),
+            list_name: list.map(|value| json_text(value, "name")).unwrap_or_default(),
+            set_name: set.map(|value| json_text(value, "name")).unwrap_or_default(),
+        });
+    }
+    (last, rows)
+}
+
+fn json_text(value: &Value, key: &str) -> String {
+    value.get(key).and_then(|item| item.as_str()).unwrap_or("").to_string()
+}
+
+fn assign_code_lists(model: &ModelDefinition, rows: &[CodeHit]) -> HashMap<String, Vec<(String, String)>> {
+    let mut out = HashMap::new();
+    for lookup in &model.lookups {
+        let mut pairs = Vec::new();
+        for hit in rows {
+            if !code_hit_matches(lookup, hit) {
+                continue;
+            }
+            if pairs.iter().any(|(code, _): &(String, String)| code.eq_ignore_ascii_case(&hit.code)) {
+                continue;
+            }
+            pairs.push((hit.code.clone(), hit.name.clone()));
+        }
+        pairs.sort_by(|left, right| left.1.to_ascii_lowercase().cmp(&right.1.to_ascii_lowercase()));
+        if !pairs.is_empty() {
+            out.insert(lookup.id.clone(), pairs);
+        }
+    }
+    out
+}
+
+fn code_hit_matches(lookup: &Lookup, hit: &CodeHit) -> bool {
+    let list_id = lookup.code_list_id.as_deref().unwrap_or("");
+    if !list_id.is_empty() && hit.list_id == list_id {
+        return true;
+    }
+    let list_label = lookup.list_label.as_deref().unwrap_or("");
+    if !list_label.is_empty() && hit.list_name.eq_ignore_ascii_case(list_label) {
+        return true;
+    }
+    !hit.set_name.is_empty()
+        && (hit.set_name.eq_ignore_ascii_case(&lookup.id) || hit.set_name.eq_ignore_ascii_case(&lookup.label))
+}
+
 fn order_search_fields(model: &ModelDefinition, entity: &str, set: &BTreeSet<String>) -> Vec<String> {
     let Some(ent) = model.entity(entity) else {
         return set.iter().cloned().collect();
@@ -2624,6 +2763,29 @@ mod tests {
         assert!(address.contains("country") && address.contains("state"), "{address:?}");
         assert!(fields.get("c360.person.Phone").unwrap().is_empty());
         assert!(fields.get("c360.person.ElectronicAddress").unwrap().is_empty());
+
+        let catalog = serde_json::json!({
+            "lastPage": true,
+            "content": [
+                {
+                    "record": {"Code": "W", "Name": "Widowed"},
+                    "codeListDetails": {"id": "636c9904ae466403ae6a2386", "name": "Enterprise Gender"},
+                    "referenceDataSetDetails": {"name": "Gender"}
+                },
+                {
+                    "record": {"Code": "S", "Name": "Single"},
+                    "codeListDetails": {"id": "marital-list", "name": "Enterprise MaritalStatus"},
+                    "referenceDataSetDetails": {"name": "MaritalStatus"}
+                }
+            ]
+        });
+        let (last, hits) = parse_r360_page(&catalog);
+        assert!(last);
+        let assigned = assign_code_lists(&model, &hits);
+        assert_eq!(assigned.get("Gender").map(|rows| rows.as_slice()), Some([("W".to_string(), "Widowed".to_string())].as_slice()));
+        assert!(assigned.get("MaritalStatus").unwrap().iter().any(|(code, name)| code == "S" && name == "Single"));
+        let empty = parse_r360_page(&serde_json::json!({"content": []}));
+        assert!(empty.0 && empty.1.is_empty());
 
         let dotted = serde_json::json!({
             "searchResult": {"hits": 1, "records": [{

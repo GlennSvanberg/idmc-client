@@ -122,6 +122,7 @@ mod tests {
         assert_eq!(gender.lookup.as_deref(), Some("Gender"));
         let gender_list = model.lookup("Gender").unwrap();
         assert!(gender_list.values.is_empty(), "export has no code rows");
+        assert_eq!(gender_list.code_list_id.as_deref(), Some("636c9904ae466403ae6a2386"));
         assert_eq!(model.lookup("State").unwrap().depends_on.as_deref(), Some("Country"));
 
         let columns = person.default_columns();

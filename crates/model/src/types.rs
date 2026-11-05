@@ -81,6 +81,9 @@ pub struct Lookup {
     pub label: String,
     #[serde(default)]
     pub guid: Option<String>,
+    /// Reference 360 default code list id (`defaultCodeList.id`).
+    #[serde(default)]
+    pub code_list_id: Option<String>,
     #[serde(default)]
     pub list_label: Option<String>,
     #[serde(default)]

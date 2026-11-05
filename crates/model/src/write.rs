@@ -517,6 +517,7 @@ mod tests {
                 id: "Country".into(),
                 label: "Country".into(),
                 guid: None,
+                code_list_id: None,
                 list_label: None,
                 depends_on: None,
                 alternates: Vec::new(),

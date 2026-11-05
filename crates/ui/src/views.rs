@@ -897,13 +897,20 @@ impl Root {
             .border_1()
             .border_color(rgb(theme.border))
             .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()));
-        if rows.is_empty() {
+        let known = rows.iter().any(|row| !row.clear && !row.free);
+        if !known && !rows.iter().any(|row| row.free) {
+            list = list.child(div().px_3().py_2().text_color(rgb(theme.muted)).child("No known values"));
+        } else if rows.is_empty() {
             list = list.child(div().px_3().py_2().text_color(rgb(theme.muted)).child("No matching value"));
         }
         for (index, row) in rows.iter().enumerate() {
             let on = index == highlight;
-            let label = row.label.clone();
-            let code = row.code.clone();
+            let label = if row.free {
+                format!("Use \"{}\"", row.label)
+            } else {
+                row.label.clone()
+            };
+            let code = if row.free || row.clear { String::new() } else { row.code.clone() };
             let clear = row.clear;
             list = list.child(
                 div()

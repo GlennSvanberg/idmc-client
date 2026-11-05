@@ -184,10 +184,16 @@ fn parse_reference(doc: &Value) -> Result<Option<Lookup>, ModelError> {
             .and_then(|v| v.as_str())
             .unwrap_or(guid)
             .to_string();
+        let code_list_id = rda
+            .get("defaultCodeList")
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         return Ok(Some(Lookup {
             id: name.clone(),
             label: name,
             guid: Some(code_guid),
+            code_list_id,
             list_label,
             depends_on,
             alternates,
@@ -403,6 +409,7 @@ fn parse_field(
                         id: guid.clone(),
                         label: guid.clone(),
                         guid: Some(guid),
+                        code_list_id: None,
                         list_label: None,
                         depends_on: None,
                         alternates: Vec::new(),
