@@ -1,0 +1,27 @@
+{
+  "searchResult": {
+    "hits": 1,
+    "records": [
+      {
+        "_meta": {
+          "businessId": "acacia-shen",
+          "id": "do-not-use-as-the-record-id",
+          "businessEntity": "c360.person",
+          "status": "ACTIVE"
+        },
+        "c360person.firstName": "Acacia",
+        "c360person.lastName": "Shen",
+        "c360person.gender": { "Name": "Female" },
+        "c360person.PostalAddress": [
+          {
+            "addressLine1": "408 Carioca Trail, Sullivan Road",
+            "city": "Salt Lake City",
+            "postalCode": "84111",
+            "country": { "Name": "United States" },
+            "state": { "Code": "UT", "Name": "Utah" }
+          }
+        ]
+      }
+    ]
+  }
+}

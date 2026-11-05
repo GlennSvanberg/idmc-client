@@ -76,7 +76,8 @@ fn parse_lookup(field: &FieldDef, text: &str, model: &ModelDefinition) -> Result
     });
     match found {
         Some(value) => Ok(FieldValue::String(value.id.clone())),
-        None => Err(format!("{} is not in the list", field.label)),
+        None if lookup.closed && !lookup.values.is_empty() => Err(format!("{} is not in the list", field.label)),
+        None => Ok(FieldValue::String(text.to_string())),
     }
 }
 
@@ -156,6 +157,28 @@ pub fn validate_edit(
         return Err(ModelError::Message(format!("unknown entity {entity}")));
     };
     check_lengths(model, &definition.fields, values)
+}
+
+/// Labels of fields that differ, for the save result.
+pub fn changed_labels(
+    model: &ModelDefinition,
+    entity: &str,
+    before: &BTreeMap<String, FieldValue>,
+    after: &BTreeMap<String, FieldValue>,
+) -> Vec<String> {
+    let Some(definition) = model.entity(entity) else {
+        return Vec::new();
+    };
+    let mut labels = Vec::new();
+    for field in &definition.fields {
+        if field.system {
+            continue;
+        }
+        if before.get(&field.name) != after.get(&field.name) {
+            labels.push(field.label.clone());
+        }
+    }
+    labels
 }
 
 fn check_lengths(
@@ -501,6 +524,7 @@ mod tests {
                     EnumValue { id: "SE".into(), label: "Sweden".into(), parent: None },
                     EnumValue { id: "NO".into(), label: "Norway".into(), parent: None },
                 ],
+                closed: true,
             }],
             relationships: Vec::new(),
         }
@@ -547,6 +571,28 @@ mod tests {
         let mut values = BTreeMap::new();
         values.insert("firstName".into(), FieldValue::String("TooLongName".into()));
         assert!(validate_edit(&model, "person", &values).is_err());
+    }
+
+    #[test]
+    fn an_untouched_unknown_code_does_not_block_a_save() {
+        let mut model = person_model();
+        model.lookups[0].closed = false;
+        let mut address = BTreeMap::new();
+        address.insert("_id".into(), FieldValue::String("a1".into()));
+        address.insert("state".into(), FieldValue::String("NE".into()));
+        let mut before = BTreeMap::new();
+        before.insert("firstName".into(), FieldValue::String("Acacia".into()));
+        before.insert("country".into(), FieldValue::String("ZZ".into()));
+        before.insert("PostalAddress".into(), FieldValue::List(vec![FieldValue::Group(address)]));
+        let mut after = before.clone();
+        after.insert("firstName".into(), FieldValue::String("Ada".into()));
+        assert!(crate::types::validate_changed(&model, "person", &before, &after).is_ok());
+        assert_eq!(changed_labels(&model, "person", &before, &after), vec!["First name".to_string()]);
+        after.insert("country".into(), FieldValue::String("Mars".into()));
+        model.lookups[0].closed = true;
+        let err = crate::types::validate_changed(&model, "person", &before, &after).unwrap_err().to_string();
+        assert!(err.contains("Mars"), "{err}");
+        assert!(err.contains("country"), "{err}");
     }
 
     #[test]

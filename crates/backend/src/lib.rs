@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use idmc_model::{
-    compose_label, load_records, validate_edit, validate_values, value_at, Cardinality, FieldSide,
+    compose_label, load_records, validate_changed, validate_edit, validate_values, value_at, Cardinality, FieldSide,
     FieldValue, IdmcExportSource, JsonModelSource, ModelDefinition, ModelError, ModelSource, Record,
 };
 
@@ -167,11 +167,16 @@ pub fn apply_records(model: &ModelDefinition, records: &mut Vec<Record>, op: &Wr
             Ok(record)
         }
         WriteKind::Update => {
-            validate_edit(model, &op.entity, &op.values).map_err(|err| BackendError::Message(err.to_string()))?;
+            let current = records
+                .iter()
+                .find(|row| row.entity == op.entity && row.id == op.id)
+                .ok_or_else(|| BackendError::Message(format!("no {} record {}", op.entity, op.id)))?;
+            validate_changed(model, &op.entity, &current.values, &op.values)
+                .map_err(|err| BackendError::Message(err.to_string()))?;
             let row = records
                 .iter_mut()
                 .find(|row| row.entity == op.entity && row.id == op.id)
-                .ok_or_else(|| BackendError::Message(format!("no {} record {}", op.entity, op.id)))?;
+                .expect("record");
             row.values = op.values.clone();
             Ok(row.clone())
         }

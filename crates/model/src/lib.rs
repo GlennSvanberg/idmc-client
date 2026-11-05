@@ -19,7 +19,7 @@ pub use idmc::IdmcExportSource;
 pub use types::*;
 pub use value::{value_at, FieldValue, Record};
 pub use write::{
-    api_body, child_record_id, edit_text, lookup_choices, parse_field, patch_ops, push_child, read_field,
+    api_body, changed_labels, child_record_id, edit_text, lookup_choices, parse_field, patch_ops, push_child, read_field,
     remove_child, set_child_field, split_child_id, validate_edit, DEFAULT_SOURCE_SYSTEM,
 };
 

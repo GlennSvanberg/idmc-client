@@ -1,0 +1,37 @@
+{
+  "firstName": "Acacia",
+  "middleName": "",
+  "lastName": "Shen",
+  "fullName": "Acacia Shen",
+  "birthDate": "1970-12-15",
+  "gender": { "Code": "F", "Name": "Female" },
+  "PostalAddress": [
+    {
+      "_id": "addr-acacia",
+      "addressLine1": "408 Carioca Trail, Sullivan Road",
+      "city": "Salt Lake City",
+      "postalCode": "84111",
+      "country": { "Code": "US", "Name": "United States" },
+      "state": { "Code": "UT", "Name": "Utah" }
+    }
+  ],
+  "Phone": [
+    {
+      "_id": "phone-acacia",
+      "phoneType": { "Code": "LandLine", "Name": "Landline" },
+      "phoneNumber": "-8346"
+    }
+  ],
+  "ElectronicAddress": [
+    {
+      "_id": "mail-acacia",
+      "electronicAddress": "ShenAcacia@gmail.com"
+    }
+  ],
+  "_meta": {
+    "id": "do-not-use-as-the-record-id",
+    "businessId": "acacia-shen",
+    "state": "ACTIVE"
+  },
+  "_contentMeta": { "trust": { "fieldData": [] } }
+}

@@ -89,6 +89,10 @@ pub struct Lookup {
     pub alternates: Vec<String>,
     #[serde(default)]
     pub values: Vec<EnumValue>,
+    /// The value rows are the tenant catalog. A sample file and codes seen on
+    /// records are not closed, so an unknown code is left for the server.
+    #[serde(default)]
+    pub closed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -777,6 +781,109 @@ fn check_value_map(
     Ok(())
 }
 
+/// Checks fields whose value changed. An untouched address code is not
+/// rejected because a sample code list does not know the tenant's codes.
+pub fn validate_changed(
+    model: &ModelDefinition,
+    entity_id: &str,
+    before: &BTreeMap<String, FieldValue>,
+    after: &BTreeMap<String, FieldValue>,
+) -> Result<(), ModelError> {
+    let Some(entity) = model.entity(entity_id) else {
+        return Err(ModelError::Message(format!("unknown entity {entity_id}")));
+    };
+    check_changed_map(model, &entity.id, &entity.fields, before, after, &entity.id)
+}
+
+fn check_changed_map(
+    model: &ModelDefinition,
+    entity_id: &str,
+    fields: &[FieldDef],
+    before: &BTreeMap<String, FieldValue>,
+    after: &BTreeMap<String, FieldValue>,
+    path: &str,
+) -> Result<(), ModelError> {
+    for field in fields {
+        if field.system {
+            continue;
+        }
+        let left = before.get(&field.name);
+        let right = after.get(&field.name);
+        if left == right {
+            continue;
+        }
+        let here = if path == entity_id {
+            format!("{entity_id}.{}", field.name)
+        } else {
+            format!("{path}.{}", field.name)
+        };
+        if field.ty == FieldType::Group {
+            check_changed_groups(model, entity_id, field, left, right, &here)?;
+            continue;
+        }
+        if field.mandatory && is_empty(right) && !field.many {
+            return Err(ModelError::Message(format!("{here} is required")));
+        }
+        if let Some(limit) = field.length {
+            if let Some(FieldValue::String(text)) = right {
+                if text.chars().count() > limit as usize {
+                    return Err(ModelError::Message(format!("{here} is longer than {limit}")));
+                }
+            }
+        }
+        if let Some(value) = right {
+            check_scalar(model, field, value, &here)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_changed_groups(
+    model: &ModelDefinition,
+    entity_id: &str,
+    field: &FieldDef,
+    left: Option<&FieldValue>,
+    right: Option<&FieldValue>,
+    path: &str,
+) -> Result<(), ModelError> {
+    let before = group_maps(left);
+    let after = group_maps(right);
+    for (index, item) in after.iter().enumerate() {
+        let previous = group_id(item)
+            .filter(|id| !id.is_empty())
+            .and_then(|id| before.iter().find(|row| group_id(row).as_deref() == Some(id.as_str())))
+            .or_else(|| before.get(index));
+        let here = format!("{path}[{index}]");
+        match previous {
+            Some(previous) if previous == item => {}
+            Some(previous) => check_changed_map(model, entity_id, &field.children, previous, item, &here)?,
+            None => check_value_map(model, entity_id, &field.children, item, &here)?,
+        }
+    }
+    Ok(())
+}
+
+fn group_maps(value: Option<&FieldValue>) -> Vec<BTreeMap<String, FieldValue>> {
+    match value {
+        Some(FieldValue::List(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                FieldValue::Group(map) => Some(map.clone()),
+                _ => None,
+            })
+            .collect(),
+        Some(FieldValue::Group(map)) => vec![map.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn group_id(map: &BTreeMap<String, FieldValue>) -> Option<String> {
+    match map.get("_id") {
+        Some(FieldValue::String(text)) if !text.is_empty() => Some(text.clone()),
+        _ => None,
+    }
+}
+
 fn check_scalar(
     model: &ModelDefinition,
     field: &FieldDef,
@@ -813,7 +920,8 @@ fn check_scalar(
             if field.ty == FieldType::Lookup {
                 if let Some(id) = field.lookup.as_deref() {
                     if let Some(lookup) = model.lookup(id) {
-                        if !lookup.values.is_empty()
+                        if lookup.closed
+                            && !lookup.values.is_empty()
                             && !text.is_empty()
                             && !lookup.values.iter().any(|v| v.id == *text)
                         {

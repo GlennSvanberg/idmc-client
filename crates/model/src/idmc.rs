@@ -192,6 +192,7 @@ fn parse_reference(doc: &Value) -> Result<Option<Lookup>, ModelError> {
             depends_on,
             alternates,
             values: Vec::new(),
+            closed: false,
         }));
     }
     Ok(None)
@@ -406,6 +407,7 @@ fn parse_field(
                         depends_on: None,
                         alternates: Vec::new(),
                         values: Vec::new(),
+                        closed: false,
                     });
                 }
             }

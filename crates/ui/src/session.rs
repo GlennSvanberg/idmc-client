@@ -190,12 +190,19 @@ pub enum EditMove {
     Up,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveToast {
+    pub error: bool,
+    pub text: String,
+}
+
 pub struct Session {
     pub backend: AppBackend,
     pub file: WorkspaceFile,
     pub workspace_path: PathBuf,
     pub data_path: Option<PathBuf>,
     pub status: String,
+    pub toast: Option<SaveToast>,
     pub palette: PaletteState,
     pub menu: Option<MenuState>,
     pub chooser_for: Option<String>,
@@ -284,6 +291,7 @@ impl Session {
             fallback: None,
             login_line: None,
             palette_recent: Vec::new(),
+            toast: None,
         }
     }
 
@@ -2136,17 +2144,32 @@ impl Session {
         let keys: Vec<String> = self.drafts.keys().cloned().collect();
         if keys.is_empty() {
             self.status = "Nothing to save".into();
+            self.toast = Some(SaveToast { error: false, text: self.status.clone() });
             return;
         }
+        let mut labels = Vec::new();
         for key in keys {
             let Some(record) = self.drafts.get(&key).cloned() else { continue };
+            let before = self.backend.record(&record.entity, &record.id).map(|row| row.values.clone()).unwrap_or_default();
+            labels.extend(idmc_model::changed_labels(self.backend.model(), &record.entity, &before, &record.values));
             if let Err(err) = self.write_record(record) {
-                self.status = err;
+                self.show_save(true, err);
                 return;
             }
         }
         self.draft_rev = self.draft_rev.wrapping_add(1);
-        self.status = "Saved".into();
+        if self.backend.is_live() {
+            self.show_save(false, "Saving…".into());
+        } else if labels.is_empty() {
+            self.show_save(false, "Saved".into());
+        } else {
+            self.show_save(false, format!("Saved {}", labels.join(", ")));
+        }
+    }
+
+    fn show_save(&mut self, error: bool, text: String) {
+        self.status = text.clone();
+        self.toast = Some(SaveToast { error, text });
     }
 
     fn write_record(&mut self, record: Record) -> Result<(), String> {
@@ -2358,14 +2381,14 @@ impl Session {
                 if let Some(record) = note.restore {
                     self.remember_draft(record);
                 }
-                self.status = format!("Save failed: {message}");
-            } else {
+                self.show_save(true, message);
+            } else if let Some(message) = note.message {
                 if let Some(to) = note.to_id.as_deref() {
                     self.retarget_id(&note.from_id, to);
                 }
-                if let Some(message) = note.message {
-                    self.status = message;
-                }
+                self.show_save(false, message);
+            } else if let Some(to) = note.to_id.as_deref() {
+                self.retarget_id(&note.from_id, to);
             }
         }
         changed
@@ -2943,7 +2966,7 @@ mod tests {
             assert!(session.commit_edit(EditMove::Stay), "{}", session.status);
         }
         session.save_records();
-        assert_eq!(session.status, "Saved", "{}", session.status);
+        assert!(session.status.starts_with("Saved"), "{}", session.status);
         let created = session.file.selections.get("table-c360.person").cloned().unwrap();
         assert!(session.backend.record("c360.person", &created).is_some());
 
@@ -2974,7 +2997,7 @@ mod tests {
             assert!(session.commit_edit(EditMove::Stay), "{}", session.status);
         }
         session.save_records();
-        assert_eq!(session.status, "Saved", "{}", session.status);
+        assert!(session.status.starts_with("Saved"), "{}", session.status);
         assert!(session.backend.related("c360.person.PostalAddress#items", &first).unwrap().len() > before);
 
         session.file.focus = Some("table-c360.person".into());

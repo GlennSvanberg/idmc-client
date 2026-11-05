@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use idmc_model::{
-    api_body, expand_key, patch_ops, FieldDef, FieldType, FieldValue, GraphEdge, IdmcExportSource,
+    api_body, changed_labels, expand_key, patch_ops, FieldDef, FieldType, FieldValue, GraphEdge, IdmcExportSource,
     JsonModelSource, ModelDefinition, ModelSource, NodeId, Record, Scene,
 };
 use serde_json::{Map, Value};
@@ -426,17 +426,13 @@ impl LiveBackend {
     }
 
     /// GET one master off the UI thread and keep the body on that record.
+    /// Search rows omit calculated fields and some groups, so a visible row
+    /// is read back even when the search hit already contained a field group.
     fn schedule_hydrate(&self, entity: &str, id: &str) {
-        if self.model.embedded_children(entity).next().is_none() {
-            return;
-        }
         let key = format!("{entity}\0{id}");
         {
             let mut cache = lock(&self.shared.cache);
-            if cache.hydrated.contains(&key) || cache.inflight.contains(&key) {
-                return;
-            }
-            if !cache.index.contains_key(&key) {
+            if cache.hydrated.contains(&key) || cache.inflight.contains(&key) || cache.inflight.len() >= MAX_FLIGHT {
                 return;
             }
             cache.inflight.insert(key.clone());
@@ -542,6 +538,23 @@ impl LiveBackend {
         }
         for offset in offsets {
             self.spawn_page(entity, offset, epoch);
+        }
+        let visible = {
+            let hub = lock(&self.shared.hub);
+            let Some(view) = hub.views.get(entity) else { return };
+            let hits = view.hits.unwrap_or(0);
+            let end = end.min(hits);
+            let mut ids = Vec::new();
+            for index in start..end {
+                let offset = (index as u64 / PAGE) * PAGE;
+                if let Some(row) = view.pages.get(&offset).and_then(|page| page.get(index - offset as usize)) {
+                    ids.push(row.id.clone());
+                }
+            }
+            ids
+        };
+        for id in visible {
+            self.schedule_hydrate(entity, &id);
         }
     }
 
@@ -720,7 +733,7 @@ fn expand_live(shared: &Shared, model: &ModelDefinition, key: &str) -> Scene {
     scene
 }
 
-fn fetch_entity(shared: &Shared, model: &ModelDefinition, entity: &str, id: &str) -> Result<(), BackendError> {
+fn fetch_entity(shared: &Shared, model: &ModelDefinition, entity: &str, id: &str) -> Result<Record, BackendError> {
     let base = shared.http.mdm_base().ok_or_else(|| BackendError::Message("not logged in".into()))?;
     let url = format!(
         "{base}/business-entity/public/api/v1/entity/{}/{}",
@@ -729,9 +742,10 @@ fn fetch_entity(shared: &Shared, model: &ModelDefinition, entity: &str, id: &str
     );
     let body = shared.http.get_json(&url)?;
     let parsed = parse_entity_record(model, entity, &body)?;
+    let record = parsed.record.clone();
     let mut cache = lock(&shared.cache);
     remember(&mut cache, parsed);
-    Ok(())
+    Ok(record)
 }
 
 fn metadata_edges(entity: &str, body: &Value) -> Vec<GraphEdge> {
@@ -773,9 +787,14 @@ fn hydrate_one(shared: Arc<Shared>, model: Arc<ModelDefinition>, entity: String,
     cache.inflight.remove(&key);
     match outcome {
         Ok(parsed) => {
+            let record = parsed.record.clone();
             remember(&mut cache, parsed);
             cache.hydrated.insert(key);
             drop(cache);
+            {
+                let mut hub = lock(&shared.hub);
+                replace_in_pages(&mut hub, &record);
+            }
             publish(&shared, true);
         }
         Err(err) => {
@@ -1073,14 +1092,35 @@ fn finish_write(shared: Arc<Shared>, model: Arc<ModelDefinition>, op: WriteOp, b
             if let Some(id) = &assigned {
                 rename_record(&shared, &optimistic, id);
             }
-            let message = value.get("approvalRequired").and_then(|flag| flag.as_bool()).unwrap_or(false).then(|| {
-                "Saved. A data steward must approve this change.".to_string()
-            });
+            let id = assigned.clone().unwrap_or_else(|| optimistic.id.clone());
+            let previous = before.as_ref().map(|row| row.values.clone()).unwrap_or_default();
+            let wrote = changed_labels(&model, &op.entity, &previous, &op.values);
+            let mut message = match op.kind {
+                WriteKind::Create => format!("Created {}", if wrote.is_empty() { optimistic.entity.clone() } else { wrote.join(", ") }),
+                WriteKind::Delete => format!("Deleted {}", optimistic.id),
+                WriteKind::Update => {
+                    if wrote.is_empty() {
+                        "Saved".into()
+                    } else {
+                        format!("Saved {}", wrote.join(", "))
+                    }
+                }
+            };
+            if value.get("approvalRequired").and_then(|flag| flag.as_bool()).unwrap_or(false) {
+                message.push_str(". A data steward must approve this change");
+            }
+            match fetch_entity(&shared, &model, &optimistic.entity, &id) {
+                Ok(record) => {
+                    let mut hub = lock(&shared.hub);
+                    replace_in_pages(&mut hub, &record);
+                }
+                Err(err) => message.push_str(&format!(". Refresh failed: {err}")),
+            }
             push_notice(
                 &shared,
                 WriteNotice {
                     error: None,
-                    message,
+                    message: Some(message),
                     entity: optimistic.entity,
                     from_id: optimistic.id,
                     to_id: assigned,
@@ -1641,7 +1681,7 @@ impl IdmcHttp {
                 continue;
             }
             let text = response.text().map_err(|err| BackendError::Message(format!("http: {err}")))?;
-            self.dump_response(method, url, status, &text);
+            self.dump_response(method, url, body, status, &text);
             self.note(&format!("{method} {url} HTTP {status} in {}ms", started.elapsed().as_millis()));
             if status == 401 {
                 let msg = failure_line(status, &text);
@@ -1713,24 +1753,36 @@ impl IdmcHttp {
                 continue;
             }
             let text = response.text().unwrap_or_default();
-            self.dump_response("POST", url, status, &text);
+            self.dump_response("POST", url, Some(body), status, &text);
             let value = serde_json::from_str(&text).unwrap_or(Value::Null);
             return Ok((status, value, text));
         }
     }
 
-    fn dump_response(&self, method: &str, url: &str, status: u16, body: &str) {
+    fn dump_response(&self, method: &str, url: &str, request: Option<&Value>, status: u16, body: &str) {
         let Ok(mut slot) = self.dump.lock() else { return };
         let Some(file) = slot.as_mut() else { return };
-        let rendered = match serde_json::from_str::<Value>(body) {
-            Ok(mut value) => {
-                redact_json(&mut value);
-                serde_json::to_string_pretty(&value).unwrap_or_else(|_| "[unreadable json]".into())
-            }
-            Err(_) => format!("[non-json body, {} bytes]", body.len()),
-        };
-        let _ = writeln!(file, "{method} {url}\nstatus {status}\n{rendered}\n");
+        let _ = writeln!(file, "{}\n", format_dump(method, url, request, status, body));
     }
+}
+
+pub(crate) fn format_dump(method: &str, url: &str, request: Option<&Value>, status: u16, body: &str) -> String {
+    let request_text = match request {
+        Some(value) => {
+            let mut copy = value.clone();
+            redact_json(&mut copy);
+            serde_json::to_string_pretty(&copy).unwrap_or_else(|_| "[unreadable json]".into())
+        }
+        None => "(no body)".into(),
+    };
+    let response_text = match serde_json::from_str::<Value>(body) {
+        Ok(mut value) => {
+            redact_json(&mut value);
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "[unreadable json]".into())
+        }
+        Err(_) => format!("[non-json body, {} bytes]", body.len()),
+    };
+    format!("{method} {url}\nrequest\n{request_text}\nstatus {status}\n{response_text}")
 }
 
 pub fn mdm_base_from_api_url(url: &str) -> Result<String, BackendError> {
@@ -1885,14 +1937,10 @@ fn master_from_object(
     let Some(id) = business_id(obj) else { return Ok(None) };
     let fields = model.entity(entity).map(|ent| ent.fields.clone()).unwrap_or_default();
     let (values, lookups) = convert_object(model, entity, &fields, obj, from_search);
-    let hydrated = model.embedded_children(entity).next().is_none()
-        || model.embedded_children(entity).any(|child| {
-            child.embedded_in.as_ref().is_some_and(|emb| values.contains_key(&emb.field))
-        });
     Ok(Some(ParsedRecord {
         record: Record { entity: entity.to_string(), id, values },
         lookups,
-        hydrated: hydrated || !from_search,
+        hydrated: !from_search,
     }))
 }
 
@@ -1920,17 +1968,20 @@ fn convert_object(
         if key.is_empty() || key.starts_with('_') {
             continue;
         }
-        let (name, nested) = match key.split_once('.') {
-            Some((head, tail)) if find_field(fields, head).is_none() => (head, Some(tail)),
-            _ => (key, None),
-        };
+        let (name, nested) = split_field_key(fields, key);
         let field = find_field(fields, name);
-        let converted = convert_value(model, entity, field, raw_value, &mut lookups);
+        let leaf = nested.and_then(|tail| field.and_then(|group| find_field(&group.children, tail.split('.').next().unwrap_or(tail))));
+        let converted = convert_value(model, entity, leaf.or(field), raw_value, &mut lookups);
         if let Some(tail) = nested {
-            let entry = values.entry(name.to_string()).or_insert_with(|| FieldValue::Group(BTreeMap::new()));
-            if let FieldValue::Group(map) = entry {
-                map.insert(tail.to_string(), converted);
-            }
+            let many = field.is_some_and(|group| group.many);
+            let entry = values.entry(name.to_string()).or_insert_with(|| {
+                if many {
+                    FieldValue::List(vec![FieldValue::Group(BTreeMap::new())])
+                } else {
+                    FieldValue::Group(BTreeMap::new())
+                }
+            });
+            insert_nested(entry, tail, converted);
         } else {
             values.insert(name.to_string(), converted);
         }
@@ -1957,7 +2008,17 @@ fn convert_value(
     match value {
         Value::Null => FieldValue::Null,
         Value::Bool(flag) => FieldValue::Bool(*flag),
-        Value::Number(number) => FieldValue::Number(number.as_f64().unwrap_or(0.0)),
+        Value::Number(number) => {
+            let n = number.as_f64().unwrap_or(0.0);
+            if let Some(field) = field {
+                if matches!(field.ty, FieldType::Date | FieldType::DateTime) {
+                    if let Some(text) = format_epoch(n, field.ty == FieldType::Date) {
+                        return FieldValue::String(text);
+                    }
+                }
+            }
+            FieldValue::Number(n)
+        }
         Value::String(text) => FieldValue::String(text.clone()),
         Value::Array(items) => {
             let (child_entity, child_fields) = group_context(model, entity, field);
@@ -2020,6 +2081,71 @@ fn as_lookup(value: &Value, force: bool) -> Option<(String, Option<String>)> {
     }
     let stored = code.clone().or(name.clone())?;
     Some((stored, name.or(code)))
+}
+
+fn split_field_key<'a>(fields: &[FieldDef], key: &'a str) -> (&'a str, Option<&'a str>) {
+    let Some((head, tail)) = key.split_once('.') else {
+        return (key, None);
+    };
+    match find_field(fields, head) {
+        Some(field) if field.ty == FieldType::Group || field.many => (head, Some(tail)),
+        Some(_) => (key, None),
+        None => (head, Some(tail)),
+    }
+}
+
+fn insert_nested(slot: &mut FieldValue, path: &str, value: FieldValue) {
+    let (head, tail) = path.split_once('.').map(|(head, tail)| (head, Some(tail))).unwrap_or((path, None));
+    let map = match slot {
+        FieldValue::Group(map) => map,
+        FieldValue::List(items) => {
+            if items.is_empty() {
+                items.push(FieldValue::Group(BTreeMap::new()));
+            }
+            match items.first_mut() {
+                Some(FieldValue::Group(map)) => map,
+                _ => return,
+            }
+        }
+        _ => return,
+    };
+    if let Some(tail) = tail {
+        let child = map.entry(head.to_string()).or_insert_with(|| FieldValue::Group(BTreeMap::new()));
+        insert_nested(child, tail, value);
+    } else {
+        map.insert(head.to_string(), value);
+    }
+}
+
+fn format_epoch(n: f64, date_only: bool) -> Option<String> {
+    if !n.is_finite() || n < 10_000_000_000.0 {
+        return None;
+    }
+    let ms = n as i64;
+    let days = ms.div_euclid(86_400_000);
+    let (year, month, day) = ymd_from_unix_days(days);
+    if date_only {
+        return Some(format!("{year:04}-{month:02}-{day:02}"));
+    }
+    let tod = ms.rem_euclid(86_400_000) as u64;
+    let hour = tod / 3_600_000;
+    let minute = (tod % 3_600_000) / 60_000;
+    let second = (tod % 60_000) / 1000;
+    Some(format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}"))
+}
+
+fn ymd_from_unix_days(mut z: i64) -> (i32, u32, u32) {
+    z += 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+    (year as i32, month, day)
 }
 
 fn find_field<'a>(fields: &'a [FieldDef], name: &str) -> Option<&'a FieldDef> {
@@ -2201,7 +2327,7 @@ fn preview_body(body: &str) -> String {
             if rendered.contains("eyJ") {
                 return "request failed".into();
             }
-            rendered.chars().take(180).collect()
+            rendered.chars().take(2000).collect()
         }
         Err(_) => public_error(trimmed),
     }
@@ -2352,6 +2478,76 @@ mod tests {
         assert_eq!(read.record.values.get("firstName"), Some(&FieldValue::String("Andrew".into())));
         assert!(read.record.values.get("_contentMeta").is_none());
         assert!(read.hydrated);
+        assert!(!page.records[0].hydrated, "a search hit is not a full record");
+    }
+
+    #[test]
+    fn search_omits_fields_that_the_entity_read_returns() {
+        let model = person_model();
+        let search: Value = serde_json::from_str(include_str!("../fixtures/acacia-search.json")).unwrap();
+        let page = parse_search_page(&model, "c360.person", &search).unwrap();
+        let row = &page.records[0].record;
+        assert_eq!(row.id, "acacia-shen");
+        assert!(row.values.get("fullName").is_none(), "search did not return fullName");
+        assert!(row.values.get("birthDate").is_none(), "search did not return birthDate");
+        assert!(row.values.get("Phone").is_none());
+        assert!(row.values.get("ElectronicAddress").is_none());
+        assert_eq!(row.values.get("gender"), Some(&FieldValue::String("Female".into())));
+        let addresses = crate::project_children(&model, row, "c360.person.PostalAddress");
+        assert_eq!(addresses[0].values.get("addressLine1"), Some(&FieldValue::String("408 Carioca Trail, Sullivan Road".into())));
+        assert_eq!(addresses[0].values.get("postalCode"), Some(&FieldValue::String("84111".into())));
+        assert_eq!(addresses[0].values.get("state"), Some(&FieldValue::String("UT".into())));
+        assert_eq!(addresses[0].values.get("country"), Some(&FieldValue::String("United States".into())));
+        assert!(!page.records[0].hydrated);
+
+        let entity: Value = serde_json::from_str(include_str!("../fixtures/acacia-get.json")).unwrap();
+        let read = parse_entity_record(&model, "c360.person", &entity).unwrap();
+        assert!(read.hydrated);
+        assert_eq!(read.record.values.get("fullName"), Some(&FieldValue::String("Acacia Shen".into())));
+        assert_eq!(read.record.values.get("birthDate"), Some(&FieldValue::String("1970-12-15".into())));
+        let phones = crate::project_children(&model, &read.record, "c360.person.Phone");
+        assert_eq!(phones[0].values.get("phoneNumber"), Some(&FieldValue::String("-8346".into())));
+        let mail = crate::project_children(&model, &read.record, "c360.person.ElectronicAddress");
+        assert_eq!(mail[0].values.get("electronicAddress"), Some(&FieldValue::String("ShenAcacia@gmail.com".into())));
+        assert!(read.record.values.get("_contentMeta").is_none());
+
+        let dotted = serde_json::json!({
+            "searchResult": {"hits": 1, "records": [{
+                "_meta": {"businessId": "dotted"},
+                "c360person.firstName": "Ada",
+                "c360person.birthDate": 30067200000.0_f64,
+                "c360person.PostalAddress.addressLine1": "Main",
+                "c360person.PostalAddress.city": "Oslo"
+            }]}
+        });
+        let flat = parse_search_page(&model, "c360.person", &dotted).unwrap();
+        assert_eq!(flat.records[0].record.values.get("birthDate"), Some(&FieldValue::String("1970-12-15".into())));
+        let nested = crate::project_children(&model, &flat.records[0].record, "c360.person.PostalAddress");
+        assert_eq!(nested[0].values.get("addressLine1"), Some(&FieldValue::String("Main".into())));
+        assert_eq!(nested[0].values.get("city"), Some(&FieldValue::String("Oslo".into())));
+    }
+
+    #[test]
+    fn debug_dump_records_the_write_request_without_secrets() {
+        let body = serde_json::json!({
+            "op": "replace",
+            "path": "firstName",
+            "password": "s3cret-password",
+            "value": "Ada"
+        });
+        let text = format_dump(
+            "PATCH",
+            "https://mdm.example/business-entity/public/api/v1/entity/c360.person/acacia?sourceSystem=c360.default.system",
+            Some(&body),
+            400,
+            r#"{"error":{"code":"BAD","message":"state code is not valid"},"password":"s3cret-password"}"#,
+        );
+        assert!(text.contains("PATCH https://mdm.example/business-entity"), "{text}");
+        assert!(text.contains("\"path\": \"firstName\""), "{text}");
+        assert!(text.contains("\"value\": \"Ada\""), "{text}");
+        assert!(text.contains("state code is not valid"), "{text}");
+        assert!(!text.contains("s3cret-password"), "{text}");
+        assert!(text.contains("\"password\": \"***\""), "{text}");
     }
 
     #[test]

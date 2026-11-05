@@ -825,6 +825,7 @@ impl Render for Root {
             .child(self.title_bar(&theme, window, cx))
             .child(div().flex_1().min_h_0().p_2().child(surface))
             .children(self.confirm_bar(&theme, cx))
+            .children(self.save_toast(&theme, cx))
             .child(self.status_bar(&theme))
             .children(self.column_resize_overlay(cx));
         if let Some(palette) = palette {
@@ -1176,6 +1177,28 @@ impl Root {
                             cx.notify();
                         })),
                 ),
+        )
+    }
+
+    fn save_toast(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let toast = self.session.toast.clone()?;
+        Some(
+            div()
+                .id("save-toast")
+                .px_3()
+                .py_2()
+                .flex()
+                .items_center()
+                .bg(rgb(if toast.error { theme.warn } else { theme.accent_dim }))
+                .text_color(rgb(if toast.error { theme.bg } else { theme.text }))
+                .text_size(px(12.))
+                .cursor_pointer()
+                .child(toast.text)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.session.toast = None;
+                    cx.notify();
+                }))
+                .into_any_element(),
         )
     }
 
