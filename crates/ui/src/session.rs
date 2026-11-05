@@ -164,6 +164,21 @@ pub struct CellEdit {
     pub edit: TextEdit,
     pub choices: Vec<(String, String)>,
     pub error: Option<String>,
+    /// Reference-value editor. The text is a filter; `choice_at` is the highlighted row.
+    pub lookup: bool,
+    pub required: bool,
+    /// Label shown before the editor opened. The matching option stays checked.
+    pub committed: String,
+    pub choice_at: usize,
+    pub anchor: Option<(f32, f32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LookupRow {
+    pub code: String,
+    pub label: String,
+    pub checked: bool,
+    pub clear: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1771,11 +1786,16 @@ impl Session {
             return;
         };
         let text = idmc_model::edit_text(self.backend.model(), &field, idmc_model::read_field(&record, &field));
+        let choices = idmc_model::lookup_choices(self.backend.model(), field.lookup.as_deref());
+        let lookup = field.ty == FieldType::Lookup && !choices.is_empty();
         let mut edit = TextEdit::new();
         for ch in text.chars() {
             edit.insert(ch);
         }
-        let choices = idmc_model::lookup_choices(self.backend.model(), field.lookup.as_deref());
+        if lookup {
+            edit.select_all();
+        }
+        let choice_at = lookup_index(&choices, &text, field.mandatory);
         self.file.focus = Some(view.to_string());
         self.editing = Some(CellEdit {
             view: view.to_string(),
@@ -1785,7 +1805,101 @@ impl Session {
             edit,
             choices,
             error: None,
+            lookup,
+            required: field.mandatory,
+            committed: text,
+            choice_at,
+            anchor: None,
         });
+    }
+
+    pub fn place_lookup(&mut self, x: f32, y: f32) {
+        if let Some(edit) = self.editing.as_mut() {
+            if edit.lookup {
+                edit.anchor = Some((x, y + 22.));
+            }
+        }
+    }
+
+    pub fn focused_lookup(&self) -> bool {
+        let Some(cursor) = self.cell.as_ref() else { return false };
+        if self.focused_table().as_deref() != Some(cursor.view.as_str()) {
+            return false;
+        }
+        let Some(spec) = self.spec(&cursor.view) else { return false };
+        let Some(field) = spec.columns.get(cursor.col) else { return false };
+        let Some(definition) = self.backend.model().entity(&spec.entity).and_then(|entity| entity.field(field)) else {
+            return false;
+        };
+        definition.ty == FieldType::Lookup
+            && !idmc_model::lookup_choices(self.backend.model(), definition.lookup.as_deref()).is_empty()
+    }
+
+    pub fn lookup_rows(&self) -> Vec<LookupRow> {
+        let Some(edit) = &self.editing else { return Vec::new() };
+        if !edit.lookup {
+            return Vec::new();
+        }
+        let query = if edit.edit.selection() == Some((0, edit.edit.len_chars())) {
+            String::new()
+        } else {
+            edit.edit.text.trim().to_ascii_lowercase()
+        };
+        let mut rows = Vec::new();
+        if !edit.required {
+            rows.push(LookupRow {
+                code: String::new(),
+                label: "Clear".into(),
+                checked: edit.committed.trim().is_empty(),
+                clear: true,
+            });
+        }
+        for (code, label) in &edit.choices {
+            if !lookup_hit(label, code, &query) {
+                continue;
+            }
+            rows.push(LookupRow {
+                code: code.clone(),
+                label: label.clone(),
+                checked: label.eq_ignore_ascii_case(&edit.committed) || code.eq_ignore_ascii_case(&edit.committed),
+                clear: false,
+            });
+        }
+        rows
+    }
+
+    pub fn move_lookup(&mut self, delta: i32) {
+        let len = self.lookup_rows().len();
+        if len == 0 {
+            return;
+        }
+        if let Some(edit) = self.editing.as_mut() {
+            let next = (edit.choice_at as i32 + delta).clamp(0, len as i32 - 1) as usize;
+            edit.choice_at = next;
+        }
+    }
+
+    pub fn confirm_lookup(&mut self) -> bool {
+        let rows = self.lookup_rows();
+        if self.editing.as_ref().is_none_or(|edit| !edit.lookup) {
+            return false;
+        }
+        let Some(row) = rows.get(self.editing.as_ref().map(|edit| edit.choice_at).unwrap_or(0).min(rows.len().saturating_sub(1))).cloned() else {
+            self.status = "No matching value".into();
+            if let Some(edit) = self.editing.as_mut() {
+                edit.error = Some(self.status.clone());
+            }
+            return false;
+        };
+        let label = if row.clear { String::new() } else { row.label };
+        if let Some(edit) = self.editing.as_mut() {
+            edit.edit = TextEdit::new();
+            for ch in label.chars() {
+                edit.edit.insert(ch);
+            }
+            edit.error = None;
+        }
+        self.commit_edit(EditMove::Down)
     }
 
     fn record_for_edit(&self, entity: &str, id: &str) -> Option<Record> {
@@ -1938,6 +2052,9 @@ impl Session {
         if let Some(edit) = self.editing.as_mut() {
             edit.edit.insert(ch);
             edit.error = None;
+            if edit.lookup {
+                edit.choice_at = 0;
+            }
         }
     }
 
@@ -1978,34 +2095,11 @@ impl Session {
         }
     }
 
-    pub fn cycle_choice(&mut self, delta: i32) {
-        let Some(edit) = self.editing.as_mut() else { return };
-        if edit.choices.is_empty() {
-            return;
+    pub fn choose_lookup(&mut self, index: usize) -> bool {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.choice_at = index;
         }
-        let current = edit
-            .choices
-            .iter()
-            .position(|(code, label)| label.eq_ignore_ascii_case(&edit.edit.text) || code.eq_ignore_ascii_case(&edit.edit.text))
-            .unwrap_or(0);
-        let len = edit.choices.len() as i32;
-        let next = (current as i32 + delta).rem_euclid(len) as usize;
-        let label = edit.choices[next].1.clone();
-        edit.edit = TextEdit::new();
-        for ch in label.chars() {
-            edit.edit.insert(ch);
-        }
-        edit.error = None;
-    }
-
-    pub fn pick_choice(&mut self, index: usize) {
-        let Some(edit) = self.editing.as_mut() else { return };
-        let Some((_, label)) = edit.choices.get(index).cloned() else { return };
-        edit.edit = TextEdit::new();
-        for ch in label.chars() {
-            edit.edit.insert(ch);
-        }
-        edit.error = None;
+        self.confirm_lookup()
     }
 
     pub fn save_records(&mut self) {
@@ -2397,6 +2491,29 @@ impl PaletteRow {
             header: false,
             hit: Some(hit.clone()),
         }
+    }
+}
+
+fn lookup_hit(label: &str, code: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let label = label.to_ascii_lowercase();
+    let code = code.to_ascii_lowercase();
+    label.starts_with(query)
+        || code.starts_with(query)
+        || label.split(|ch: char| !ch.is_ascii_alphanumeric()).any(|word| word.starts_with(query))
+}
+
+fn lookup_index(choices: &[(String, String)], committed: &str, required: bool) -> usize {
+    let found = choices
+        .iter()
+        .position(|(code, label)| label.eq_ignore_ascii_case(committed) || code.eq_ignore_ascii_case(committed));
+    match found {
+        Some(index) if !required => index + 1,
+        Some(index) => index,
+        None if !required && committed.trim().is_empty() => 0,
+        None => 0,
     }
 }
 
@@ -2822,6 +2939,48 @@ mod tests {
         assert!(session.pending_delete.is_some());
         session.confirm_delete();
         assert!(session.backend.record("c360.person", &created).is_none());
+    }
+
+    #[test]
+    fn lookup_menu_filters_checks_the_current_value_and_can_clear() {
+        let backend = AppBackend::Mock(MockBackend::open_default().unwrap());
+        let file = default_workspace(backend.model());
+        let mut session = Session::boot(backend, file, PathBuf::from("workspace.json"), None);
+        let gender = session.backend.model().entity("c360.person").unwrap().field("gender").unwrap();
+        assert_eq!(gender.ty, FieldType::Lookup);
+        assert!(!gender.mandatory);
+        session.file.focus = Some("table-c360.person".into());
+        let person = session.rows("table-c360.person").into_iter().find(|row| {
+            session.cell("c360.person", "gender", row) == "Female"
+        }).expect("a female person");
+        session.select("table-c360.person", &person.id);
+        session.begin_edit("table-c360.person", &person.id, "gender");
+        let open = session.lookup_rows();
+        assert!(open.iter().any(|row| row.clear), "{open:?}");
+        assert!(open.iter().any(|row| row.label == "Female" && row.checked), "{open:?}");
+        assert!(open.iter().any(|row| row.label == "Male"));
+        session.edit_insert('m');
+        let filtered = session.lookup_rows();
+        assert!(filtered.iter().any(|row| row.label == "Male"), "{filtered:?}");
+        assert!(filtered.iter().all(|row| row.label != "Female"), "{filtered:?}");
+        session.move_lookup(1);
+        assert!(session.confirm_lookup());
+        let saved_row = session
+            .drafts
+            .values()
+            .find(|row| row.id == person.id)
+            .cloned()
+            .expect("draft");
+        assert_eq!(session.cell("c360.person", "gender", &saved_row), "Male");
+        session.begin_edit("table-c360.person", &person.id, "gender");
+        let clear = session.lookup_rows().iter().position(|row| row.clear).unwrap();
+        assert!(session.choose_lookup(clear));
+        let cleared = session.cell(
+            "c360.person",
+            "gender",
+            &session.drafts.values().find(|row| row.id == person.id).cloned().unwrap(),
+        );
+        assert!(cleared.is_empty(), "{cleared}");
     }
 
     #[test]

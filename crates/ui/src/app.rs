@@ -327,6 +327,22 @@ impl Root {
                     self.session.edit_focused_cell();
                     true
                 }
+                _ if plain && self.session.focused_lookup() => event
+                    .keystroke
+                    .key_char
+                    .as_ref()
+                    .and_then(|text| {
+                        let mut chars = text.chars();
+                        let ch = chars.next()?;
+                        if chars.next().is_none() && !ch.is_control() {
+                            self.session.edit_focused_cell();
+                            self.session.edit_insert(ch);
+                            Some(())
+                        } else {
+                            None
+                        }
+                    })
+                    .is_some(),
                 _ => false,
             };
             if handled {
@@ -421,9 +437,12 @@ impl Root {
             return;
         }
         let shift = mods.shift;
-        let choices = self.session.editing.as_ref().is_some_and(|edit| !edit.choices.is_empty());
+        let lookup = self.session.editing.as_ref().is_some_and(|edit| edit.lookup);
         match key {
             "escape" => self.session.cancel_edit(),
+            "enter" if lookup => {
+                self.session.confirm_lookup();
+            }
             "enter" => {
                 self.session.commit_edit(crate::session::EditMove::Down);
             }
@@ -441,8 +460,8 @@ impl Root {
             "right" => self.session.edit_right(shift),
             "home" => self.session.edit_home(shift),
             "end" => self.session.edit_end(shift),
-            "up" if choices => self.session.cycle_choice(-1),
-            "down" if choices => self.session.cycle_choice(1),
+            "up" if lookup => self.session.move_lookup(-1),
+            "down" if lookup => self.session.move_lookup(1),
             "up" => {
                 self.session.commit_edit(crate::session::EditMove::Up);
             }
@@ -708,6 +727,10 @@ impl Render for Root {
                     this.session.menu = None;
                     cx.notify();
                 }
+                if this.session.editing.as_ref().is_some_and(|edit| edit.lookup) {
+                    this.session.cancel_edit();
+                    cx.notify();
+                }
             }))
             .child(self.title_bar(&theme, window, cx))
             .child(div().flex_1().min_h_0().p_2().child(surface))
@@ -725,6 +748,9 @@ impl Render for Root {
                 if let Some(spec) = self.session.spec(&id).cloned() {
                     root = root.child(self.render_chooser(&id, &spec.entity, &spec.columns, &theme, viewport, cx));
                 }
+            }
+            if let Some(menu) = self.render_lookup(&theme, viewport, cx) {
+                root = root.child(menu);
             }
         }
         root

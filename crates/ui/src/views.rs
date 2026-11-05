@@ -417,7 +417,6 @@ impl Root {
                     .child(header.w(width))
                     .child(body),
             )
-            .children(self.choice_strip(id, theme, cx))
             .into_any_element()
     }
 
@@ -505,12 +504,14 @@ impl Root {
                     .border_1()
                     .border_color(rgb(if focused { theme.accent } else { if on { theme.accent_dim } else { theme.panel } }))
                     .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
-                    .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                         this.session.select(&view_for_cell, &record_for_cell);
                         if let Some(cursor) = this.session.cell.as_mut() {
                             cursor.col = col_index;
                         }
                         this.session.begin_edit(&view_for_cell, &record_for_cell, &column_id);
+                        let at = event.position();
+                        this.session.place_lookup(f32::from(at.x), f32::from(at.y));
                         cx.notify();
                     }))
                     .child(match editor {
@@ -681,9 +682,11 @@ impl Root {
                             .py(px(3.))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(theme.hover)))
-                            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                                 this.session.select(&view_id, &record_id);
                                 this.session.begin_edit(&view_id, &record_id, &field_id);
+                                let at = event.position();
+                                this.session.place_lookup(f32::from(at.x), f32::from(at.y));
                                 cx.notify();
                             }))
                             .child(div().w(px(180.)).text_color(rgb(theme.muted)).child(field.label.clone()))
@@ -708,33 +711,77 @@ impl Root {
             .flex_col()
             .child(self.view_header(id, theme, cx))
             .child(body)
-            .children(self.choice_strip(id, theme, cx))
             .into_any_element()
     }
 
-    fn choice_strip(&self, view: &str, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let edit = self.session.editing.as_ref().filter(|edit| edit.view == view && !edit.choices.is_empty())?;
-        let choices: Vec<(String, String)> = edit.choices.iter().take(16).cloned().collect();
-        let mut row = div().flex().flex_row().flex_wrap().gap_1().px_2().py_1().bg(rgb(theme.raised));
-        for (index, (_code, label)) in choices.into_iter().enumerate() {
-            row = row.child(
+    pub(crate) fn render_lookup(
+        &self,
+        theme: &Theme,
+        viewport: gpui::Size<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (anchor, highlight) = {
+            let edit = self.session.editing.as_ref().filter(|edit| edit.lookup)?;
+            (edit.anchor.unwrap_or((24., 120.)), edit.choice_at)
+        };
+        let rows = self.session.lookup_rows();
+        let max_h = (crate::popover::popover_max_height(f32::from(viewport.height)) - 48.).max(120.);
+        let mut list = div()
+            .id("lookup-list")
+            .w(px(240.))
+            .max_h(px(max_h))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(theme.raised))
+            .border_1()
+            .border_color(rgb(theme.border))
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()));
+        if rows.is_empty() {
+            list = list.child(div().px_3().py_2().text_color(rgb(theme.muted)).child("No matching value"));
+        }
+        for (index, row) in rows.iter().enumerate() {
+            let on = index == highlight;
+            let label = row.label.clone();
+            let code = row.code.clone();
+            let clear = row.clear;
+            list = list.child(
                 div()
-                    .id(SharedString::from(format!("choice-{view}-{index}")))
+                    .id(SharedString::from(format!("lookup-{index}")))
+                    .h(px(28.))
                     .px_2()
-                    .py(px(2.))
-                    .rounded_sm()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
                     .cursor_pointer()
-                    .bg(rgb(theme.accent))
-                    .text_color(rgb(theme.on_accent))
-                    .child(label)
+                    .bg(rgb(if on { theme.accent_dim } else { theme.raised }))
+                    .border_l(px(3.))
+                    .border_color(rgb(if on { theme.accent } else { theme.raised }))
+                    .hover(|style| style.bg(rgb(theme.hover)))
                     .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                        this.session.pick_choice(index);
-                        this.session.commit_edit(crate::session::EditMove::Stay);
+                        this.session.choose_lookup(index);
+                        cx.stop_propagation();
                         cx.notify();
-                    })),
+                    }))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .text_color(rgb(theme.accent))
+                            .child(if row.checked { "✓" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_color(rgb(if clear { theme.subtle } else { theme.text }))
+                            .child(label),
+                    )
+                    .child(div().text_size(px(11.)).text_color(rgb(theme.subtle)).child(if clear { String::new() } else { code })),
             );
         }
-        Some(row.into_any_element())
+        Some(crate::popover::anchor_popover(point(px(anchor.0), px(anchor.1)), false, list))
     }
 
     fn render_tree(&self, id: &str, entity: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
