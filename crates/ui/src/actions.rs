@@ -46,6 +46,48 @@ pub static ACTIONS: &[Action] = &[
     Action { id: "record.delete", title: "Delete record", shortcut: None },
 ];
 
+pub fn action_subtitle(id: &str) -> &'static str {
+    match id {
+        "palette.open" => "Search commands and records",
+        "theme.toggle" => "Switch the light and dark theme",
+        "workspace.save" => "Write the workspace file",
+        "workspace.reload" => "Read the workspace file again",
+        "workspace.reset" => "Restore the model default",
+        "workspace.new" => "Start from a template",
+        "workspace.duplicate" => "Copy the current workspace",
+        "workspace.rename" => "Change the workspace name",
+        "workspace.close" => "Close this workspace",
+        "record.search" => "Find a person or other record",
+        "view.open_graph" => "Open the graph",
+        "record.show_in_graph" => "Focus the selected record",
+        "data.reload" => "Read records again",
+        "app.quit" => "Leave the application",
+        "view.close" => "Close the focused view",
+        "view.zoom" => "Fill the window with this view",
+        "view.focus_next" => "Move focus to the next view",
+        "view.focus_prev" => "Move focus to the previous view",
+        "view.move_left" => "Dock the focused view left",
+        "view.move_right" => "Dock the focused view right",
+        "view.move_up" => "Dock the focused view above",
+        "view.move_down" => "Dock the focused view below",
+        "view.new_table" => "Open a table of an entity",
+        "view.new_detail" => "Open a detail of an entity",
+        "view.new_tree" => "Open a hierarchy",
+        "view.open" => "Open a table, detail, or tree",
+        "view.fields" => "Choose and reorder columns",
+        "view.link" => "Drive this view from another",
+        "view.unlink" => "Show every record",
+        "selection.next" => "Move to the next row",
+        "selection.prev" => "Move to the previous row",
+        "record.new" => "Create a record",
+        "record.new_child" => "Create a child of the selection",
+        "record.save" => "Write the pending edits",
+        "record.revert" => "Drop the pending edits",
+        "record.delete" => "Remove the selected record",
+        _ => "",
+    }
+}
+
 pub fn registry() -> &'static [Action] {
     ACTIONS
 }

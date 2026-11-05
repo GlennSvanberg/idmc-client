@@ -227,6 +227,7 @@ pub struct Session {
     pub column_drop: Option<(String, usize)>,
     pub fallback: Option<MockSource>,
     login_line: Option<String>,
+    palette_recent: Vec<String>,
 }
 
 pub enum Launch {
@@ -282,6 +283,7 @@ impl Session {
             column_drop: None,
             fallback: None,
             login_line: None,
+            palette_recent: Vec::new(),
         }
     }
 
@@ -794,9 +796,11 @@ impl Session {
                     return Effect::None;
                 };
                 if is_drill(action.id) {
+                    self.remember_palette(action.id);
                     self.perform(action.id);
                     return Effect::None;
                 }
+                self.remember_palette(action.id);
                 self.palette.open = false;
                 self.palette.edit.clear();
                 self.search_hits.clear();
@@ -873,8 +877,21 @@ impl Session {
                 let actions = palette_actions(self.palette.query());
                 let mut rows = Vec::new();
                 if self.palette.query().trim().is_empty() {
-                    for section in ["General", "Workspace", "Views", "Records", "Data"] {
-                        let group: Vec<_> = actions.iter().copied().filter(|action| action_section(action.id) == section).collect();
+                    let recent_ids: Vec<&str> = self.palette_recent.iter().map(String::as_str).collect();
+                    let recent: Vec<_> = recent_ids
+                        .iter()
+                        .filter_map(|id| actions.iter().copied().find(|action| action.id == *id))
+                        .collect();
+                    if !recent.is_empty() {
+                        rows.push(PaletteRow::header("Recent".into()));
+                        rows.extend(recent.iter().copied().map(PaletteRow::from_action));
+                    }
+                    for section in ["Navigation", "Workspace", "Views", "Records", "Data"] {
+                        let group: Vec<_> = actions
+                            .iter()
+                            .copied()
+                            .filter(|action| action_section(action.id) == section && !recent_ids.contains(&action.id))
+                            .collect();
                         if group.is_empty() {
                             continue;
                         }
@@ -1138,6 +1155,7 @@ impl Session {
             return false;
         }
         let id = row.detail.clone();
+        self.remember_palette(&id);
         self.perform(&id);
         true
     }
@@ -1149,6 +1167,15 @@ impl Session {
         } else {
             false
         }
+    }
+
+    fn remember_palette(&mut self, id: &str) {
+        if id == "palette.open" {
+            return;
+        }
+        self.palette_recent.retain(|item| item != id);
+        self.palette_recent.insert(0, id.to_string());
+        self.palette_recent.truncate(4);
     }
 
     fn land_palette_cursor(&mut self) {
@@ -2458,6 +2485,7 @@ impl Session {
 
 pub struct PaletteRow {
     pub title: String,
+    pub subtitle: String,
     pub shortcut: String,
     pub detail: String,
     pub header: bool,
@@ -2468,6 +2496,7 @@ impl PaletteRow {
     fn from_action(action: &Action) -> Self {
         Self {
             title: action.title.to_string(),
+            subtitle: crate::actions::action_subtitle(action.id).to_string(),
             shortcut: action.shortcut.map(crate::actions::shortcut_label).unwrap_or_default(),
             detail: action.id.to_string(),
             header: false,
@@ -2476,16 +2505,31 @@ impl PaletteRow {
     }
 
     fn plain(title: String) -> Self {
-        Self { title, shortcut: String::new(), detail: String::new(), header: false, hit: None }
+        Self {
+            title,
+            subtitle: String::new(),
+            shortcut: String::new(),
+            detail: String::new(),
+            header: false,
+            hit: None,
+        }
     }
 
     fn header(title: String) -> Self {
-        Self { title, shortcut: String::new(), detail: String::new(), header: true, hit: None }
+        Self {
+            title,
+            subtitle: String::new(),
+            shortcut: String::new(),
+            detail: String::new(),
+            header: true,
+            hit: None,
+        }
     }
 
     fn hit(hit: &SearchHit) -> Self {
         Self {
             title: hit.label.clone(),
+            subtitle: hit.detail.clone(),
             shortcut: String::new(),
             detail: hit.detail.clone(),
             header: false,
@@ -2534,7 +2578,7 @@ fn action_section(id: &str) -> &'static str {
     } else if id.starts_with("data.") {
         "Data"
     } else {
-        "General"
+        "Navigation"
     }
 }
 
@@ -3076,6 +3120,11 @@ mod tests {
             session.type_char(ch);
         }
         assert!(session.palette_rows().iter().any(|row| row.detail == "view.new_table"));
+        session.palette.edit.clear();
+        session.palette_back();
+        let rows = session.palette_rows();
+        assert_eq!(rows.first().map(|row| row.title.as_str()), Some("Recent"));
+        assert!(rows.iter().any(|row| row.detail == "view.new_table" && row.subtitle.contains("table")));
         session.palette.edit.clear();
         session.backspace();
         assert!(session.palette.query().is_empty());

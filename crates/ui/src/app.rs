@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use gpui::{
-    actions, div, img, point, px, prelude::*, rgb, size, transparent_black, AnyElement, App, Application,
+    actions, div, hsla, img, point, px, prelude::*, rgb, size, transparent_black, AnyElement, App, Application,
     Bounds, ClickEvent, Context, CursorStyle, Decorations, FocusHandle, KeyBinding, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Render, ScrollHandle, SharedString, Timer,
     TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowControlArea, WindowDecorations,
@@ -485,20 +485,9 @@ impl Root {
 
     fn render_palette(&self, theme: &Theme, viewport: gpui::Size<gpui::Pixels>, cx: &mut Context<Self>) -> AnyElement {
         let rows = self.session.palette_rows();
-        let title = match &self.session.palette.mode {
-            PaletteMode::Commands => "Commands",
-            PaletteMode::PickEntity(kind) => match kind {
-                idmc_model::ViewKind::Table => "New table",
-                idmc_model::ViewKind::Detail => "New detail",
-                idmc_model::ViewKind::Tree => "New tree",
-                idmc_model::ViewKind::Graph => "Graph",
-            },
-            PaletteMode::PickLink(_) => "Source link",
-            PaletteMode::OpenView => "Open view",
-            PaletteMode::PickTemplate => "New workspace",
-            PaletteMode::RenameWorkspace => "Rename workspace",
-        };
-        let list_h = (crate::popover::popover_max_height(f32::from(viewport.height)) - 88.).max(120.);
+        let crumb = self.session.palette_crumb();
+        let nested = crumb.len() > 1;
+        let list_h = (f32::from(viewport.height) - 280.).max(160.);
         let mut list = div()
             .id("palette-list")
             .flex()
@@ -506,10 +495,30 @@ impl Root {
             .max_h(px(list_h))
             .overflow_y_scroll();
         if rows.is_empty() {
-            list = list.child(div().px_3().py_2().text_color(rgb(theme.muted)).child("No matches"));
+            list = list.child(
+                div()
+                    .px_3()
+                    .py_3()
+                    .text_color(rgb(theme.muted))
+                    .child(format!("No results for \"{}\"", self.session.palette.query().trim())),
+            );
         }
         for (index, row) in rows.iter().enumerate() {
-            let on = index == self.session.palette.cursor;
+            let on = index == self.session.palette.cursor && !row.header;
+            let subtitle = if row.header {
+                String::new()
+            } else if !row.subtitle.is_empty() {
+                row.subtitle.clone()
+            } else {
+                match &self.session.palette.mode {
+                    PaletteMode::OpenView => "Open view".into(),
+                    PaletteMode::PickLink(_) => "Use this view as the source".into(),
+                    PaletteMode::PickTemplate => "New workspace".into(),
+                    PaletteMode::PickEntity(_) => "Choose an entity".into(),
+                    _ => String::new(),
+                }
+            };
+            let drill = self.session.drill_row(row);
             list = list.child(
                 div()
                     .id(SharedString::from(format!("pal-{index}")))
@@ -517,20 +526,52 @@ impl Root {
                     .flex_row()
                     .items_center()
                     .px_3()
-                    .h(px(30.))
+                    .h(px(if row.header { 22. } else { 46. }))
                     .gap_2()
                     .bg(rgb(if on { theme.accent_dim } else { theme.raised }))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(theme.hover)))
-                    .child(div().flex_1().text_color(rgb(if row.header { theme.subtle } else { theme.text })).child(row.title.clone()))
-                    .child(div().text_size(px(11.)).text_color(rgb(if on { theme.accent } else { theme.muted })).child(if self.session.drill_row(row) {
-                        "›".to_string()
-                    } else if row.hit.is_some() {
-                        row.detail.clone()
-                    } else {
-                        row.shortcut.clone()
-                    }))
+                    .border_l(px(3.))
+                    .border_color(rgb(if on { theme.accent } else { theme.raised }))
+                    .when(!row.header, |row_el| {
+                        row_el.cursor_pointer().hover(|style| style.bg(rgb(theme.hover)))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(px(if row.header { 11. } else { 13. }))
+                                    .text_color(rgb(if row.header { theme.subtle } else { theme.text }))
+                                    .child(row.title.clone()),
+                            )
+                            .when(!subtitle.is_empty(), |col| {
+                                col.child(div().text_size(px(11.)).text_color(rgb(theme.subtle)).child(subtitle))
+                            }),
+                    )
+                    .when(drill, |row_el| {
+                        row_el.child(div().text_size(px(14.)).text_color(rgb(theme.accent)).child("›"))
+                    })
+                    .when(!row.shortcut.is_empty(), |row_el| {
+                        row_el.child(
+                            div()
+                                .px_1()
+                                .py(px(1.))
+                                .rounded_sm()
+                                .bg(rgb(theme.bg))
+                                .border_1()
+                                .border_color(rgb(theme.border))
+                                .text_size(px(10.))
+                                .text_color(rgb(theme.muted))
+                                .child(row.shortcut.clone()),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if this.session.palette_rows().get(index).is_some_and(|row| row.header) {
+                            return;
+                        }
                         this.session.palette.cursor = index;
                         let effect = this.session.confirm_palette();
                         if effect == Effect::Quit {
@@ -540,14 +581,31 @@ impl Root {
                     })),
             );
         }
-        let width = 520.;
-        let origin_x = ((f32::from(viewport.width) - width) / 2.).max(8.);
-        let crumb = self.session.palette_crumb().join("  ›  ");
-        crate::popover::anchor_popover(
-            point(px(origin_x), px(64.)),
-            false,
-            div()
-                    .w(px(width))
+        let placeholder = match &self.session.palette.mode {
+            PaletteMode::Commands => "Search commands and records",
+            PaletteMode::RenameWorkspace => "Workspace name",
+            PaletteMode::OpenView => "Search views",
+            PaletteMode::PickTemplate => "Search templates",
+            PaletteMode::PickLink(_) => "Search sources",
+            PaletteMode::PickEntity(_) => "Search entities",
+        };
+        div()
+            .absolute()
+            .size_full()
+            .bg(hsla(0., 0., 0., 0.55))
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(72.))
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                this.session.palette.open = false;
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .w(px(560.))
+                    .max_h(px((f32::from(viewport.height) - 120.).max(240.)))
                     .rounded_md()
                     .bg(rgb(theme.raised))
                     .border_1()
@@ -560,39 +618,71 @@ impl Root {
                         div()
                             .px_3()
                             .py_2()
-                            .border_b_1()
-                            .border_color(rgb(theme.border))
+                            .border_2()
+                            .border_color(rgb(theme.accent))
                             .flex()
                             .flex_col()
-                            .gap(px(2.))
-                            .child(div().text_size(px(11.)).text_color(rgb(theme.accent)).child(if self.session.palette_crumb().len() > 1 { crumb } else { title.to_string() }))
+                            .gap(px(4.))
+                            .when(nested, |block| {
+                                block.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(theme.accent))
+                                        .child(crumb.join("  ›  ")),
+                                )
+                            })
                             .child(
-                                div()
-                                    .text_size(px(14.))
-                                    .text_color(rgb(theme.text))
-                                    .child(render_edit_line(
-                                        &self.session.palette.edit,
-                                        if matches!(self.session.palette.mode, PaletteMode::Commands) {
-                                            "Command or record name"
-                                        } else if matches!(self.session.palette.mode, PaletteMode::RenameWorkspace) {
-                                            "Workspace name"
-                                        } else {
-                                            "Type to filter"
-                                        },
-                                        theme,
-                                    )),
+                                div().text_size(px(16.)).text_color(rgb(theme.text)).child(render_edit_line(
+                                    &self.session.palette.edit,
+                                    placeholder,
+                                    theme,
+                                )),
                             ),
                     )
                     .child(list)
-                    .child(
-                        div()
-                            .px_3()
-                            .py_1()
-                            .text_size(px(11.))
-                            .text_color(rgb(theme.subtle))
-                            .child("Arrows move · Enter opens · Right drills in · Left or Backspace goes back"),
-                    ),
-        )
+                    .child(self.palette_footer(theme, nested)),
+            )
+            .into_any_element()
+    }
+
+    fn palette_footer(&self, theme: &Theme, nested: bool) -> impl IntoElement {
+        let mut bar = div()
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .border_t_1()
+            .border_color(rgb(theme.border))
+            .text_size(px(11.))
+            .text_color(rgb(theme.subtle));
+        for (key, label) in [("Enter", "run"), ("Esc", "close")] {
+            bar = bar.child(self.palette_hint(theme, key, label));
+        }
+        if nested {
+            bar = bar.child(self.palette_hint(theme, "⌫", "back"));
+        }
+        bar.child(self.palette_hint(theme, "Right", "open"))
+    }
+
+    fn palette_hint(&self, theme: &Theme, key: &str, label: &str) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgb(theme.bg))
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .text_color(rgb(theme.text))
+                    .child(key.to_string()),
+            )
+            .child(label.to_string())
     }
 
     fn render_menu(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
