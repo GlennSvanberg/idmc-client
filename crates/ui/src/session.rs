@@ -123,6 +123,15 @@ pub struct ColumnResize {
     pub origin_width: f32,
 }
 
+#[derive(Clone, Debug)]
+pub struct HScrollDrag {
+    pub view: String,
+    pub origin_x: f32,
+    pub origin_thumb: f32,
+    pub travel: f32,
+    pub range: f32,
+}
+
 pub const MIN_COLUMN_WIDTH: f32 = 64.;
 pub const DEFAULT_COLUMN_WIDTH: f32 = 148.;
 
@@ -170,7 +179,7 @@ pub struct CellEdit {
     /// Label shown before the editor opened. The matching option stays checked.
     pub committed: String,
     pub choice_at: usize,
-    pub anchor: Option<(f32, f32)>,
+    pub lookup_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +241,9 @@ pub struct Session {
     pub page_rows: usize,
     pub column_resize: Option<ColumnResize>,
     pub column_drop: Option<(String, usize)>,
+    pub h_scroll_drag: Option<HScrollDrag>,
+    lookup_names: HashMap<(String, String), String>,
+    pub lookup_anchor: std::rc::Rc<std::cell::Cell<Option<(f32, f32)>>>,
     pub fallback: Option<MockSource>,
     login_line: Option<String>,
     palette_recent: Vec<String>,
@@ -288,6 +300,9 @@ impl Session {
             page_rows: 12,
             column_resize: None,
             column_drop: None,
+            h_scroll_drag: None,
+            lookup_names: HashMap::new(),
+            lookup_anchor: std::rc::Rc::new(std::cell::Cell::new(None)),
             fallback: None,
             login_line: None,
             palette_recent: Vec::new(),
@@ -527,10 +542,8 @@ impl Session {
             };
         }
         if field.ty == FieldType::Lookup {
-            if let FieldValue::String(code) = value {
-                if let Some(name) = self.backend.lookup_name(field.lookup.as_deref(), code) {
-                    return name;
-                }
+            if let Some(name) = self.lookup_display_name(field, value) {
+                return name;
             }
         }
         self.backend
@@ -1820,8 +1833,14 @@ impl Session {
             self.status = "That row is not loaded".into();
             return;
         };
-        let text = idmc_model::edit_text(self.backend.model(), &field, idmc_model::read_field(&record, &field));
-        let choices = idmc_model::lookup_choices(self.backend.model(), field.lookup.as_deref());
+        let raw = idmc_model::read_field(&record, &field);
+        let mut text = idmc_model::edit_text(self.backend.model(), &field, raw);
+        if let Some(value) = raw {
+            if let Some(name) = self.lookup_display_name(&field, value) {
+                text = name;
+            }
+        }
+        let choices = self.menu_choices(&field, &text);
         let lookup = field.ty == FieldType::Lookup && !choices.is_empty();
         let mut edit = TextEdit::new();
         for ch in text.chars() {
@@ -1832,6 +1851,7 @@ impl Session {
         }
         let choice_at = lookup_index(&choices, &text, field.mandatory);
         self.file.focus = Some(view.to_string());
+        self.lookup_anchor.set(None);
         self.editing = Some(CellEdit {
             view: view.to_string(),
             record_id: record_id.to_string(),
@@ -1844,16 +1864,75 @@ impl Session {
             required: field.mandatory,
             committed: text,
             choice_at,
-            anchor: None,
+            lookup_id: field.lookup.clone(),
         });
     }
 
-    pub fn place_lookup(&mut self, x: f32, y: f32) {
-        if let Some(edit) = self.editing.as_mut() {
-            if edit.lookup {
-                edit.anchor = Some((x, y + 22.));
+    fn menu_choices(&self, field: &FieldDef, current: &str) -> Vec<(String, String)> {
+        let Some(id) = field.lookup.as_deref() else { return Vec::new() };
+        if field.ty != FieldType::Lookup {
+            return Vec::new();
+        }
+        let sample = idmc_model::lookup_choices(self.backend.model(), Some(id));
+        let closed = self
+            .backend
+            .model()
+            .lookup(id)
+            .is_some_and(|lookup| lookup.closed && !lookup.values.is_empty());
+        let seen = if self.backend.is_live() {
+            self.backend.lookup_catalog(id)
+        } else {
+            Vec::new()
+        };
+        lookup_menu_values(self.backend.is_live(), closed, sample, seen, current)
+    }
+
+    fn lookup_display_name(&self, field: &FieldDef, value: &FieldValue) -> Option<String> {
+        let (code, explicit) = match value {
+            FieldValue::String(text) => (text.as_str(), None),
+            FieldValue::Group(map) => {
+                let code = match map.get("Code").or_else(|| map.get("code")) {
+                    Some(FieldValue::String(text)) => text.as_str(),
+                    _ => "",
+                };
+                let name = match map.get("Name").or_else(|| map.get("name")) {
+                    Some(FieldValue::String(text)) if !text.is_empty() => Some(text.clone()),
+                    _ => None,
+                };
+                (code, name)
+            }
+            _ => return None,
+        };
+        if let Some(name) = explicit {
+            if !code.is_empty() && name != code {
+                return Some(name);
+            }
+            if code.is_empty() {
+                return Some(name);
             }
         }
+        if code.is_empty() {
+            return None;
+        }
+        let id = field.lookup.as_deref()?;
+        if let Some(name) = self.lookup_names.get(&(id.to_string(), code.to_string())) {
+            return Some(name.clone());
+        }
+        if let Some(name) = self.backend.lookup_name(Some(id), code) {
+            return Some(name);
+        }
+        let label = self.backend.model().lookup_label(Some(id), code);
+        if label != code {
+            return Some(label);
+        }
+        None
+    }
+
+    fn note_lookup(&mut self, lookup: &str, code: &str, label: &str) {
+        if code.is_empty() || label.is_empty() || code.eq_ignore_ascii_case(label) {
+            return;
+        }
+        self.lookup_names.insert((lookup.to_string(), code.to_string()), label.to_string());
     }
 
     pub fn focused_lookup(&self) -> bool {
@@ -1866,8 +1945,7 @@ impl Session {
         let Some(definition) = self.backend.model().entity(&spec.entity).and_then(|entity| entity.field(field)) else {
             return false;
         };
-        definition.ty == FieldType::Lookup
-            && !idmc_model::lookup_choices(self.backend.model(), definition.lookup.as_deref()).is_empty()
+        definition.ty == FieldType::Lookup && !self.menu_choices(definition, "").is_empty()
     }
 
     pub fn lookup_rows(&self) -> Vec<LookupRow> {
@@ -1919,6 +1997,22 @@ impl Session {
         if self.editing.as_ref().is_none_or(|edit| !edit.lookup) {
             return false;
         }
+        let typed = self.editing.as_ref().map(|edit| edit.edit.text.trim().to_string()).unwrap_or_default();
+        let closed = self.editing.as_ref().and_then(|edit| {
+            let id = edit.lookup_id.as_deref()?;
+            Some(self.backend.model().lookup(id).is_some_and(|lookup| lookup.closed))
+        }).unwrap_or(false);
+        let only_clear = !rows.is_empty() && rows.iter().all(|row| row.clear);
+        if rows.is_empty() || (only_clear && !typed.is_empty()) {
+            if closed {
+                self.status = "No matching value".into();
+                if let Some(edit) = self.editing.as_mut() {
+                    edit.error = Some(self.status.clone());
+                }
+                return false;
+            }
+            return self.commit_edit(EditMove::Stay);
+        }
         let Some(row) = rows.get(self.editing.as_ref().map(|edit| edit.choice_at).unwrap_or(0).min(rows.len().saturating_sub(1))).cloned() else {
             self.status = "No matching value".into();
             if let Some(edit) = self.editing.as_mut() {
@@ -1926,7 +2020,12 @@ impl Session {
             }
             return false;
         };
-        let label = if row.clear { String::new() } else { row.label };
+        let label = if row.clear { String::new() } else { row.label.clone() };
+        if !row.clear {
+            if let Some(id) = self.editing.as_ref().and_then(|edit| edit.lookup_id.clone()) {
+                self.note_lookup(&id, &row.code, &row.label);
+            }
+        }
         if let Some(edit) = self.editing.as_mut() {
             edit.edit = TextEdit::new();
             for ch in label.chars() {
@@ -1934,7 +2033,8 @@ impl Session {
             }
             edit.error = None;
         }
-        self.commit_edit(EditMove::Down)
+        self.lookup_anchor.set(None);
+        self.commit_edit(EditMove::Stay)
     }
 
     fn record_for_edit(&self, entity: &str, id: &str) -> Option<Record> {
@@ -1980,6 +2080,7 @@ impl Session {
             return false;
         }
         self.editing = None;
+        self.lookup_anchor.set(None);
         if next != EditMove::Stay {
             self.open_neighbor(&edit, next);
         }
@@ -1988,6 +2089,7 @@ impl Session {
 
     pub fn cancel_edit(&mut self) {
         self.editing = None;
+        self.lookup_anchor.set(None);
     }
 
     fn write_field(&mut self, entity: &str, record_id: &str, field: &FieldDef, value: FieldValue) -> Result<(), String> {
@@ -2584,6 +2686,101 @@ fn lookup_index(choices: &[(String, String)], committed: &str, required: bool) -
     }
 }
 
+fn include_current(mut rows: Vec<(String, String)>, current: &str) -> Vec<(String, String)> {
+    let current = current.trim();
+    if current.is_empty() {
+        return rows;
+    }
+    let known = rows.iter().any(|(code, label)| {
+        code.eq_ignore_ascii_case(current) || label.eq_ignore_ascii_case(current)
+    });
+    if !known {
+        rows.push((current.to_string(), current.to_string()));
+    }
+    rows
+}
+
+/// Live menus use values seen on tenant records. An empty result is a free-text
+/// editor so the sample file is not offered as the catalog. A closed list is
+/// the model. Mock mode keeps the sample list and the current value.
+pub fn lookup_menu_values(
+    live: bool,
+    closed: bool,
+    sample: Vec<(String, String)>,
+    seen: Vec<(String, String)>,
+    current: &str,
+) -> Vec<(String, String)> {
+    if closed && !sample.is_empty() {
+        return include_current(sample, current);
+    }
+    if live {
+        if seen.is_empty() {
+            return Vec::new();
+        }
+        return include_current(seen, current);
+    }
+    if sample.is_empty() {
+        return Vec::new();
+    }
+    include_current(sample, current)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HBarGeom {
+    pub thumb: f32,
+    pub thumb_x: f32,
+    pub travel: f32,
+    pub range: f32,
+}
+
+/// Thumb geometry for a horizontal bar. `offset_x` is the GPUI scroll offset
+/// (zero at the left edge, negative after scrolling right).
+pub fn hbar_geom(content: f32, view: f32, offset_x: f32) -> Option<HBarGeom> {
+    if view < 8. || content <= view + 1. {
+        return None;
+    }
+    let range = content - view;
+    let thumb = (view * view / content).clamp(28., view);
+    let travel = (view - thumb).max(1.);
+    let scrolled = (-offset_x).clamp(0., range);
+    let thumb_x = scrolled / range * travel;
+    Some(HBarGeom { thumb, thumb_x, travel, range })
+}
+
+pub fn hbar_offset(thumb_x: f32, travel: f32, range: f32) -> f32 {
+    if travel <= 0. {
+        return 0.;
+    }
+    let t = (thumb_x / travel).clamp(0., 1.);
+    -(t * range)
+}
+
+pub fn hbar_page(offset_x: f32, page: f32, range: f32, click_x: f32, thumb_x: f32, thumb: f32) -> f32 {
+    let scrolled = -offset_x;
+    let next = if click_x < thumb_x {
+        scrolled - page
+    } else if click_x > thumb_x + thumb {
+        scrolled + page
+    } else {
+        scrolled
+    };
+    -next.clamp(0., range.max(0.))
+}
+
+/// Horizontal component to apply. A plain wheel's sideways delta is dropped.
+/// Shift uses the wheel as a horizontal scroll. A precise gesture whose
+/// horizontal distance wins is a trackpad (or tilt) pan.
+pub fn sideways_delta(shift: bool, precise: bool, dx: f32, dy: f32) -> Option<f32> {
+    if shift {
+        let delta = if dx.abs() > dy.abs() { dx } else { dy };
+        if delta.abs() < 0.01 { None } else { Some(delta) }
+    } else if precise && dx.abs() > dy.abs() && dx.abs() > 0.5 {
+        Some(dx)
+    } else {
+        None
+    }
+}
+
 fn is_drill(id: &str) -> bool {
     matches!(
         id,
@@ -3031,7 +3228,10 @@ mod tests {
         assert!(filtered.iter().any(|row| row.label == "Male"), "{filtered:?}");
         assert!(filtered.iter().all(|row| row.label != "Female"), "{filtered:?}");
         session.move_lookup(1);
+        let row_before = session.cell.as_ref().map(|cursor| cursor.row);
         assert!(session.confirm_lookup());
+        assert!(session.editing.is_none(), "picking a value closes the menu");
+        assert_eq!(session.cell.as_ref().map(|cursor| cursor.row), row_before);
         let saved_row = session
             .drafts
             .values()
@@ -3077,6 +3277,41 @@ mod tests {
         assert!(session.editing.is_some());
         assert!(Session::reveal_offset(0., 100., 200., 40.) < 0.);
         assert_eq!(fitted_width("Name", &["Ann".into()]), fitted_width("Name", &[]));
+    }
+
+    #[test]
+    fn lookup_menu_uses_seen_tenant_values_and_keeps_free_text() {
+        let sample = vec![("SE-AB".into(), "Stockholm".into()), ("US-CA".into(), "California".into())];
+        let seen = vec![("SD".into(), "South Dakota".into()), ("NE".into(), "Nebraska".into())];
+        let live = lookup_menu_values(true, false, sample.clone(), seen, "South Dakota");
+        assert!(live.iter().any(|(code, label)| code == "SD" && label == "South Dakota"), "{live:?}");
+        assert!(live.iter().all(|(code, _)| code != "SE-AB" && code != "US-CA"), "{live:?}");
+        let free = lookup_menu_values(true, false, sample.clone(), Vec::new(), "South Dakota");
+        assert!(free.is_empty(), "{free:?}");
+        let mock = lookup_menu_values(false, false, sample.clone(), Vec::new(), "South Dakota");
+        assert!(mock.iter().any(|(_, label)| label == "South Dakota"), "{mock:?}");
+        assert!(mock.iter().any(|(_, label)| label == "California"), "{mock:?}");
+        let closed = lookup_menu_values(true, true, sample, Vec::new(), "Utah");
+        assert!(closed.iter().any(|(_, label)| label == "Stockholm"));
+        assert!(closed.iter().any(|(_, label)| label == "Utah"));
+    }
+
+    #[test]
+    fn wheel_stays_vertical_and_the_scrollbar_pages() {
+        assert_eq!(sideways_delta(false, false, 12., -40.), None);
+        assert_eq!(sideways_delta(false, true, -2., -40.), None);
+        assert_eq!(sideways_delta(true, false, 0., -40.), Some(-40.));
+        assert_eq!(sideways_delta(false, true, -30., -4.), Some(-30.));
+        assert!(hbar_geom(100., 200., 0.).is_none());
+        let rest = hbar_geom(1000., 200., 0.).unwrap();
+        assert_eq!(rest.thumb_x, 0.);
+        assert!(rest.thumb < 200.);
+        let mid = hbar_geom(1000., 200., -400.).unwrap();
+        assert!(mid.thumb_x > 0.);
+        let paged = hbar_page(0., 180., mid.range, mid.thumb_x + mid.thumb + 4., mid.thumb_x, mid.thumb);
+        assert!(paged < 0., "{paged}");
+        let back = hbar_offset(0., mid.travel, mid.range);
+        assert_eq!(back, 0.);
     }
 
     #[test]

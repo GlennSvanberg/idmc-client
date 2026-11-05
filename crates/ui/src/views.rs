@@ -1,9 +1,9 @@
 //! Table, detail, and tree views. Every label and column comes from the model.
 
 use gpui::{
-    div, point, px, prelude::*, rgb, uniform_list, AnyElement, Context, CursorStyle,
-    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ScrollStrategy, ScrollWheelEvent,
-    SharedString,
+    canvas, div, point, px, prelude::*, rgb, uniform_list, AnyElement, Context, CursorStyle,
+    DispatchPhase, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ScrollStrategy,
+    ScrollWheelEvent, SharedString,
 };
 use idmc_model::Record;
 use idmc_backend::Backend;
@@ -397,30 +397,153 @@ impl Root {
             .child(
                 div()
                     .id(SharedString::from(format!("grid-{id}")))
-                    .overflow_x_scroll()
+                    .relative()
+                    .overflow_hidden()
                     .track_scroll(&h_scroll)
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
-                        if !event.modifiers.shift {
-                            return;
-                        }
-                        let handle = this.horizontal_scroll(&grid_id);
-                        let delta = event.delta.pixel_delta(px(20.));
-                        let dx = if f32::from(delta.x).abs() > 0.5 { delta.x } else { delta.y };
-                        let offset = handle.offset();
-                        handle.set_offset(point(offset.x + dx, offset.y));
-                        cx.stop_propagation();
-                    }))
                     .child(header.w(width))
-                    .child(body),
+                    .child(body)
+                    .child(self.horizontal_wheel(&grid_id, cx)),
             )
+            .children(self.horizontal_bar(id, width_px, theme, cx))
             .into_any_element()
     }
 
-    fn horizontal_scroll(&self, id: &str) -> gpui::ScrollHandle {
+    fn horizontal_wheel(&self, id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let grid_id = id.to_string();
+        let entity = cx.entity();
+        canvas(
+            |bounds, _, _| bounds,
+            move |bounds, _bounds, window, _app| {
+                let grid_id = grid_id.clone();
+                let entity = entity.clone();
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, app| {
+                    if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
+                        return;
+                    }
+                    let delta = event.delta.pixel_delta(px(20.));
+                    let Some(side) = crate::session::sideways_delta(
+                        event.modifiers.shift,
+                        event.delta.precise(),
+                        f32::from(delta.x),
+                        f32::from(delta.y),
+                    ) else {
+                        return;
+                    };
+                    let _ = entity.update(app, |root, cx| {
+                        let handle = root.horizontal_scroll(&grid_id);
+                        let offset = handle.offset();
+                        handle.set_offset(point(offset.x + px(side), px(0.)));
+                        cx.stop_propagation();
+                        cx.notify();
+                    });
+                });
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .into_any_element()
+    }
+
+    fn horizontal_bar(&self, id: &str, content: f32, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let handle = self.horizontal_scroll(id);
+        let view = f32::from(handle.bounds().size.width);
+        let offset = f32::from(handle.offset().x);
+        let geom = crate::session::hbar_geom(content, view, offset)?;
+        let dragging = self.session.h_scroll_drag.as_ref().is_some_and(|drag| drag.view == id);
+        let view_id = id.to_string();
+        let origin = f32::from(handle.bounds().origin.x);
+        let thumb_x = geom.thumb_x;
+        let thumb = geom.thumb;
+        let range = geom.range;
+        let travel = geom.travel;
+        Some(
+            div()
+                .id(SharedString::from(format!("hbar-{id}")))
+                .relative()
+                .h(px(12.))
+                .w_full()
+                .flex_shrink_0()
+                .rounded(px(6.))
+                .bg(rgb(theme.raised))
+                .border_1()
+                .border_color(rgb(theme.border))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, cx.listener({
+                    let view_id = view_id.clone();
+                    move |this, event: &MouseDownEvent, _, cx| {
+                        let local = f32::from(event.position.x) - origin;
+                        if local >= thumb_x && local <= thumb_x + thumb {
+                            return;
+                        }
+                        let handle = this.horizontal_scroll(&view_id);
+                        let page = (view * 0.9).max(40.);
+                        let next = crate::session::hbar_page(offset, page, range, local, thumb_x, thumb);
+                        handle.set_offset(point(px(next), px(0.)));
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("hbar-thumb-{id}")))
+                        .absolute()
+                        .left(px(thumb_x))
+                        .top(px(2.))
+                        .w(px(thumb))
+                        .h(px(8.))
+                        .rounded(px(4.))
+                        .bg(rgb(if dragging { theme.accent } else { theme.muted }))
+                        .hover(|style| style.bg(rgb(theme.accent)))
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, cx.listener({
+                            let view_id = view_id.clone();
+                            move |this, event: &MouseDownEvent, _, cx| {
+                                this.session.h_scroll_drag = Some(crate::session::HScrollDrag {
+                                    view: view_id.clone(),
+                                    origin_x: f32::from(event.position.x),
+                                    origin_thumb: thumb_x,
+                                    travel,
+                                    range,
+                                });
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn lookup_tracker(&self, _cx: &mut Context<Self>) -> AnyElement {
+        let slot = self.session.lookup_anchor.clone();
+        canvas(
+            move |bounds, window, _| {
+                let next = (f32::from(bounds.origin.x), f32::from(bounds.origin.y + bounds.size.height));
+                let current = slot.get();
+                let changed = current.is_none_or(|(x, y)| (x - next.0).abs() > 0.5 || (y - next.1).abs() > 0.5);
+                if changed {
+                    slot.set(Some(next));
+                    window.refresh();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .into_any_element()
+    }
+
+    pub(crate) fn horizontal_scroll(&self, id: &str) -> gpui::ScrollHandle {
         let mut map = self.h_scroll.borrow_mut();
         map.entry(id.to_string()).or_insert_with(gpui::ScrollHandle::new).clone()
     }
@@ -501,23 +624,31 @@ impl Root {
                     .whitespace_nowrap()
                     .text_size(px(12.))
                     .text_color(rgb(if invalid.is_some() { theme.warn } else { theme.text }))
+                    .relative()
                     .border_1()
                     .border_color(rgb(if focused { theme.accent } else { if on { theme.accent_dim } else { theme.panel } }))
                     .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
                     .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                        let same = this.session.editing.as_ref().is_some_and(|edit| {
+                            edit.view == view_for_cell && edit.record_id == record_for_cell && edit.field == column_id
+                        });
                         this.session.select(&view_for_cell, &record_for_cell);
                         if let Some(cursor) = this.session.cell.as_mut() {
                             cursor.col = col_index;
                         }
-                        this.session.begin_edit(&view_for_cell, &record_for_cell, &column_id);
-                        let at = event.position();
-                        this.session.place_lookup(f32::from(at.x), f32::from(at.y));
+                        this.session.scroll_cell.set(true);
+                        if event.click_count() >= 2 {
+                            this.session.begin_edit(&view_for_cell, &record_for_cell, &column_id);
+                        } else if !same {
+                            this.session.cancel_edit();
+                        }
                         cx.notify();
                     }))
                     .child(match editor {
                         Some(edit) => crate::edit::render_edit_line(&edit, "", theme),
                         None => div().child(self.session.cell(entity, column, row)).into_any_element(),
-                    }),
+                    })
+                    .when(editing.is_some_and(|edit| edit.lookup), |cell| cell.child(self.lookup_tracker(cx))),
             );
         }
         line.into_any_element()
@@ -682,11 +813,10 @@ impl Root {
                             .py(px(3.))
                             .cursor_pointer()
                             .hover(|style| style.bg(rgb(theme.hover)))
-                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            .relative()
+                            .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
                                 this.session.select(&view_id, &record_id);
                                 this.session.begin_edit(&view_id, &record_id, &field_id);
-                                let at = event.position();
-                                this.session.place_lookup(f32::from(at.x), f32::from(at.y));
                                 cx.notify();
                             }))
                             .child(div().w(px(180.)).text_color(rgb(theme.muted)).child(field.label.clone()))
@@ -698,6 +828,12 @@ impl Root {
                                         Some(edit) => crate::edit::render_edit_line(&edit, "Empty", theme),
                                         None => div().child(if text.is_empty() { "—".to_string() } else { text }).into_any_element(),
                                     }),
+                            )
+                            .when(
+                                self.session.editing.as_ref().is_some_and(|edit| {
+                                    edit.lookup && edit.view == id && edit.record_id == record.id && edit.field == field.id
+                                }),
+                                |row| row.child(self.lookup_tracker(cx)),
                             ),
                     );
                 }
@@ -720,10 +856,8 @@ impl Root {
         viewport: gpui::Size<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (anchor, highlight) = {
-            let edit = self.session.editing.as_ref().filter(|edit| edit.lookup)?;
-            (edit.anchor.unwrap_or((24., 120.)), edit.choice_at)
-        };
+        let highlight = self.session.editing.as_ref().filter(|edit| edit.lookup).map(|edit| edit.choice_at)?;
+        let anchor = self.session.lookup_anchor.get()?;
         let rows = self.session.lookup_rows();
         let max_h = (crate::popover::popover_max_height(f32::from(viewport.height)) - 48.).max(120.);
         let mut list = div()

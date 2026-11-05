@@ -961,6 +961,19 @@ impl Backend for LiveBackend {
         cache.lookups.get(&(lookup.to_string(), code.to_string())).cloned()
     }
 
+    fn lookup_catalog(&self, lookup: &str) -> Vec<(String, String)> {
+        let cache = lock(&self.shared.cache);
+        let mut rows: Vec<(String, String)> = cache
+            .lookups
+            .iter()
+            .filter(|((id, _), _)| id == lookup)
+            .map(|((_, code), name)| (code.clone(), name.clone()))
+            .collect();
+        rows.sort_by(|left, right| left.1.to_ascii_lowercase().cmp(&right.1.to_ascii_lowercase()));
+        rows.dedup();
+        rows
+    }
+
     fn submit_write(&self, mut op: WriteOp) -> Result<Record, BackendError> {
         if op.source_pkey.is_empty() {
             let cache = lock(&self.shared.cache);

@@ -22,5 +22,8 @@ gpui = "=0.2.2"
 serde.workspace = true
 serde_json.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+
 [build-dependencies]
 embed-resource = "=3.0.12"

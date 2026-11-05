@@ -38,6 +38,9 @@ pub trait Backend {
     fn connection(&self) -> String { "Mock".into() }
     /// Display name captured from a live lookup `{Code, Name}` object.
     fn lookup_name(&self, _lookup: Option<&str>, _code: &str) -> Option<String> { None }
+    /// Code/name pairs seen on live records for one code list. Empty when the
+    /// tenant catalog has not been observed. The sample file is not this list.
+    fn lookup_catalog(&self, _lookup: &str) -> Vec<(String, String)> { Vec::new() }
     /// Bumps when the record set changes. Views cache sorts against this.
     fn generation(&self) -> u64 { 0 }
     /// Sorted records for one entity, shared until `generation` changes.
@@ -860,6 +863,12 @@ impl Backend for AppBackend {
         match self {
             AppBackend::Mock(_) => None,
             AppBackend::Live(backend) => backend.lookup_name(lookup, code),
+        }
+    }
+    fn lookup_catalog(&self, lookup: &str) -> Vec<(String, String)> {
+        match self {
+            AppBackend::Mock(_) => Vec::new(),
+            AppBackend::Live(backend) => backend.lookup_catalog(lookup),
         }
     }
     fn generation(&self) -> u64 {

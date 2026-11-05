@@ -827,7 +827,8 @@ impl Render for Root {
             .children(self.confirm_bar(&theme, cx))
             .children(self.save_toast(&theme, cx))
             .child(self.status_bar(&theme))
-            .children(self.column_resize_overlay(cx));
+            .children(self.column_resize_overlay(cx))
+            .children(self.h_scroll_overlay(cx));
         if let Some(palette) = palette {
             root = root.child(palette);
         }
@@ -876,8 +877,6 @@ impl Root {
                     .text_size(px(12.))
                     .bg(rgb(if on { theme.raised } else { theme.panel }))
                     .text_color(rgb(if on { theme.text } else { theme.muted }))
-                    .border_b_1()
-                    .border_color(rgb(if on { theme.accent } else { theme.panel }))
                     .child(name)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.session.switch_workspace(index);
@@ -938,17 +937,7 @@ impl Root {
             .pl_3()
             .h_full()
             .window_control_area(WindowControlArea::Drag)
-            .on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, cx| {
-                if cfg!(windows) {
-                    return;
-                }
-                if event.click_count >= 2 {
-                    window.zoom_window();
-                } else {
-                    window.start_window_move();
-                }
-                cx.stop_propagation();
-            })
+            .on_mouse_down(MouseButton::Left, title_drag)
             .child(img("logo/mark.svg").w(px(18.)).h(px(20.)).object_fit(ObjectFit::Contain))
             .child(div().text_size(px(13.)).text_color(rgb(theme.text)).child("IDMC Client"))
     }
@@ -958,17 +947,7 @@ impl Root {
             .flex_1()
             .h_full()
             .window_control_area(WindowControlArea::Drag)
-            .on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, cx| {
-                if cfg!(windows) {
-                    return;
-                }
-                if event.click_count >= 2 {
-                    window.zoom_window();
-                } else {
-                    window.start_window_move();
-                }
-                cx.stop_propagation();
-            })
+            .on_mouse_down(MouseButton::Left, title_drag)
     }
 
     fn window_controls(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1110,6 +1089,34 @@ impl Root {
             .into_any_element()
     }
 
+    fn h_scroll_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.session.h_scroll_drag.is_none() {
+            return None;
+        }
+        Some(
+            div()
+                .id("h-scroll-drag")
+                .absolute()
+                .size_full()
+                .bg(transparent_black())
+                .cursor(CursorStyle::PointingHand)
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    let Some(drag) = this.session.h_scroll_drag.clone() else { return };
+                    let dx = f32::from(event.position.x) - drag.origin_x;
+                    let thumb_x = (drag.origin_thumb + dx).clamp(0., drag.travel);
+                    let next = crate::session::hbar_offset(thumb_x, drag.travel, drag.range);
+                    let handle = this.horizontal_scroll(&drag.view);
+                    handle.set_offset(point(px(next), px(0.)));
+                    cx.notify();
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    this.session.h_scroll_drag = None;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn column_resize_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.session.column_resize.is_none() {
             return None;
@@ -1226,6 +1233,60 @@ impl Root {
             .text_color(rgb(if dirty { theme.accent } else { theme.muted }))
             .child(text)
     }
+}
+
+fn title_drag(event: &MouseDownEvent, window: &mut Window, cx: &mut App) {
+    if event.click_count >= 2 {
+        toggle_zoom(window);
+        cx.stop_propagation();
+        return;
+    }
+    window.start_window_move();
+    #[cfg(windows)]
+    caption_drag(window);
+    cx.stop_propagation();
+}
+
+fn toggle_zoom(window: &mut Window) {
+    #[cfg(windows)]
+    if window.is_maximized() {
+        post_sys(window, WM_SYSCOMMAND, SC_RESTORE);
+        return;
+    }
+    window.zoom_window();
+}
+
+#[cfg(windows)]
+fn caption_drag(window: &Window) {
+    post_sys(window, WM_NCLBUTTONDOWN, HTCAPTION);
+}
+
+#[cfg(windows)]
+fn post_sys(window: &Window, msg: u32, wparam: usize) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else { return };
+    let RawWindowHandle::Win32(win) = handle.as_raw() else { return };
+    let hwnd = win.hwnd.get() as isize;
+    unsafe {
+        ReleaseCapture();
+        PostMessageW(hwnd, msg, wparam, 0);
+    }
+}
+
+#[cfg(windows)]
+const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+#[cfg(windows)]
+const WM_SYSCOMMAND: u32 = 0x0112;
+#[cfg(windows)]
+const HTCAPTION: usize = 2;
+#[cfg(windows)]
+const SC_RESTORE: usize = 0xF120;
+
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn ReleaseCapture() -> i32;
+    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
 }
 
 pub fn run(session: Session) {
