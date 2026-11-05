@@ -1263,9 +1263,9 @@ fn caption_drag(window: &Window) {
 
 #[cfg(windows)]
 fn post_sys(window: &Window, msg: u32, wparam: usize) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let Ok(handle) = window.window_handle() else { return };
-    let RawWindowHandle::Win32(win) = handle.as_raw() else { return };
+    // `Window::window_handle` is GPUI's AnyWindowHandle. The raw HWND comes from the trait.
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else { return };
+    let raw_window_handle::RawWindowHandle::Win32(win) = handle.as_raw() else { return };
     let hwnd = win.hwnd.get() as isize;
     unsafe {
         ReleaseCapture();
