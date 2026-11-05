@@ -29,6 +29,78 @@ const MAX_FLIGHT: usize = 4;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const PUBLISH_EVERY: Duration = Duration::from_millis(400);
+const LOGIN_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Why a live sign-in did not produce a session. The text shown to the user
+/// comes from [`LoginCause::title`] plus a redacted detail line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginCause {
+    Unreachable,
+    Rejected,
+    Timeout,
+}
+
+impl LoginCause {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Unreachable => "Network unreachable",
+            Self::Rejected => "Authentication rejected",
+            Self::Timeout => "Login timed out",
+        }
+    }
+
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::Unreachable => "The login host could not be reached.",
+            Self::Rejected => "The server rejected the username or password.",
+            Self::Timeout => "The login request did not finish before the time limit.",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginFailure {
+    pub cause: LoginCause,
+    pub detail: String,
+}
+
+pub fn classify_login(message: &str) -> LoginCause {
+    let lower = message.to_ascii_lowercase();
+    if auth_rejected(&lower) {
+        return LoginCause::Rejected;
+    }
+    if timed_out(&lower) {
+        return LoginCause::Timeout;
+    }
+    LoginCause::Unreachable
+}
+
+fn auth_rejected(lower: &str) -> bool {
+    lower.contains("http 401")
+        || lower.contains("http 403")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("invalid credentials")
+        || lower.contains("authentication failed")
+}
+
+fn timed_out(lower: &str) -> bool {
+    if lower.contains("timed out") || lower.contains("timeout") || lower.contains("deadline") {
+        return true;
+    }
+    elapsed_ms(lower).is_some_and(|ms| ms >= 14_000)
+}
+
+fn elapsed_ms(lower: &str) -> Option<u128> {
+    let marker = " in ";
+    let start = lower.find(marker)? + marker.len();
+    let rest = &lower[start..];
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() || !rest[digits.len()..].starts_with("ms") {
+        return None;
+    }
+    digits.parse().ok()
+}
 
 pub struct LiveConfig {
     pub login_url: String,
@@ -57,6 +129,13 @@ struct Shared {
     last_error: Mutex<Option<String>>,
     hub: Mutex<Hub>,
     notices: Mutex<Vec<WriteNotice>>,
+    login: Mutex<LoginGate>,
+}
+
+struct LoginGate {
+    failure: Option<LoginFailure>,
+    busy: bool,
+    auto_used: bool,
 }
 
 struct Hub {
@@ -163,7 +242,14 @@ pub fn check_login(config: &LiveConfig) -> Result<String, BackendError> {
         .unwrap_or_else(|| "c360.person".into());
     step(&format!("check-login: model {}, entity {entity}", model.name));
     let http = IdmcHttp::connect(config, true)?;
-    http.login()?;
+    if let Err(err) = http.login() {
+        if classify_login(&err.to_string()) == LoginCause::Rejected {
+            return Err(err);
+        }
+        step("check-login: retrying once after backoff");
+        std::thread::sleep(LOGIN_RETRY_BACKOFF);
+        http.login()?;
+    }
     let started = Instant::now();
     let body = http.search(&entity, 0, 1)?;
     let page = parse_search_page(&model, &entity, &body)?;
@@ -206,6 +292,7 @@ impl LiveBackend {
             last_publish_ms: AtomicU64::new(0),
             last_error: Mutex::new(None),
             notices: Mutex::new(Vec::new()),
+            login: Mutex::new(LoginGate { failure: None, busy: false, auto_used: false }),
             hub: Mutex::new(Hub {
                 views: HashMap::new(),
                 started: Instant::now(),
@@ -230,6 +317,22 @@ impl LiveBackend {
 
     fn begin_load(&self) -> Result<(), BackendError> {
         let epoch = self.shared.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        self.reset_caches();
+        match self.shared.http.login() {
+            Ok(()) => self.after_login(epoch),
+            Err(err) => {
+                let failure = self.failure_from(&err.to_string());
+                let retry = failure.cause != LoginCause::Rejected;
+                self.publish_login(Some(failure), false);
+                if retry {
+                    self.spawn_login_attempt(true);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn reset_caches(&self) {
         {
             let mut cache = lock(&self.shared.cache);
             *cache = Cache::default();
@@ -242,10 +345,13 @@ impl LiveBackend {
         if let Ok(mut err) = self.shared.last_error.lock() {
             *err = None;
         }
-        self.shared.http.login()?;
+    }
+
+    fn after_login(&self, epoch: u64) -> Result<(), BackendError> {
         if let Some(base) = self.shared.http.mdm_base() {
             lock(&self.shared.hub).tenant = base;
         }
+        self.publish_login(None, false);
         self.restore_disk();
         for entity in self.roots.clone() {
             if self.shared.epoch.load(Ordering::Relaxed) != epoch {
@@ -253,8 +359,70 @@ impl LiveBackend {
             }
             self.master_touch(&entity, 0, 1);
         }
-        let _ = epoch;
         Ok(())
+    }
+
+    fn failure_from(&self, message: &str) -> LoginFailure {
+        let detail = scrub_secrets(message, &self.shared.http.username, &self.shared.http.password);
+        LoginFailure { cause: classify_login(&detail), detail }
+    }
+
+    fn publish_login(&self, failure: Option<LoginFailure>, busy: bool) {
+        {
+            let mut gate = lock(&self.shared.login);
+            gate.failure = failure;
+            gate.busy = busy;
+        }
+        self.shared.generation.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn login_failure(&self) -> Option<LoginFailure> {
+        lock(&self.shared.login).failure.clone()
+    }
+
+    pub fn login_busy(&self) -> bool {
+        lock(&self.shared.login).busy
+    }
+
+    pub fn retry_login(&self) {
+        self.spawn_login_attempt(false);
+    }
+
+    fn spawn_login_attempt(&self, backoff: bool) {
+        {
+            let mut gate = lock(&self.shared.login);
+            if gate.busy {
+                return;
+            }
+            if backoff && gate.auto_used {
+                return;
+            }
+            gate.busy = true;
+            if backoff {
+                gate.auto_used = true;
+            }
+        }
+        self.shared.generation.fetch_add(1, Ordering::Release);
+        let shared = Arc::clone(&self.shared);
+        let roots = self.roots.clone();
+        let model = Arc::clone(&self.model);
+        std::thread::spawn(move || {
+            if backoff {
+                std::thread::sleep(LOGIN_RETRY_BACKOFF);
+            }
+            let backend = LiveBackend { model, roots, shared: Arc::clone(&shared) };
+            let epoch = shared.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+            backend.reset_caches();
+            match shared.http.login() {
+                Ok(()) => {
+                    let _ = backend.after_login(epoch);
+                }
+                Err(err) => {
+                    let failure = backend.failure_from(&err.to_string());
+                    backend.publish_login(Some(failure), false);
+                }
+            }
+        });
     }
 
     /// GET one master off the UI thread and keep the body on that record.
@@ -742,6 +910,14 @@ impl Backend for LiveBackend {
     }
 
     fn connection(&self) -> String {
+        let gate = lock(&self.shared.login);
+        if gate.busy {
+            return "Live · retrying login".into();
+        }
+        if let Some(failure) = &gate.failure {
+            return format!("Live · {}", failure.cause.title());
+        }
+        drop(gate);
         let err = self.shared.last_error.lock().ok().and_then(|guard| guard.clone());
         if let Some(err) = err {
             return format!("Live · {err}");
@@ -1287,6 +1463,12 @@ impl IdmcHttp {
         }
     }
 
+    fn fail_login(&self, message: String) -> BackendError {
+        let message = scrub_secrets(&message, &self.username, &self.password);
+        self.note(&message);
+        BackendError::Message(message)
+    }
+
     fn login(&self) -> Result<(), BackendError> {
         let _gate = self.login_gate.lock().unwrap_or_else(|err| err.into_inner());
         let (v3, v2) = login_endpoints(&self.login_url);
@@ -1294,7 +1476,7 @@ impl IdmcHttp {
             "username": self.username,
             "password": self.password,
         });
-        self.note(&format!("login v3 POST {v3}"));
+        self.note(&format!("login v3 POST {}", strip_userinfo(&v3)));
         let started = Instant::now();
         let v3_result = self.post_once(&v3, &body, false);
         let session = match v3_result {
@@ -1319,9 +1501,7 @@ impl IdmcHttp {
                         }
                     }
                 } else if status == 401 || status == 403 {
-                    let msg = format!("login failed: {}", failure_line(status, &raw));
-                    self.note(&msg);
-                    return Err(BackendError::Message(msg));
+                    return Err(self.fail_login(format!("login failed: {}", failure_line(status, &raw))));
                 } else {
                     let line = failure_line(status, &raw);
                     self.note(&format!("login v3 {line}"));
@@ -1331,19 +1511,17 @@ impl IdmcHttp {
                             if matches!(status, 404 | 405 | 501) {
                                 return Err(err);
                             }
-                            return Err(BackendError::Message(format!("login failed: {line}")));
+                            return Err(self.fail_login(format!("login failed: {line}")));
                         }
                     }
                 }
             }
             Err(err) => {
-                let msg = format!(
-                    "login v3 failed in {}ms: {}",
-                    started.elapsed().as_millis(),
-                    public_error(&err.to_string())
-                );
-                self.note(&msg);
-                return Err(BackendError::Message(msg));
+                let detail = public_error(&scrub_secrets(&err.to_string(), &self.username, &self.password));
+                return Err(self.fail_login(format!(
+                    "login v3 failed in {}ms: {detail}",
+                    started.elapsed().as_millis()
+                )));
             }
         };
         *self.session.lock().unwrap_or_else(|err| err.into_inner()) = Some(session);
@@ -1351,19 +1529,24 @@ impl IdmcHttp {
     }
 
     fn login_v2(&self, url: &str, body: &Value) -> Result<SessionInfo, BackendError> {
-        self.note(&format!("login v2 POST {url}"));
+        self.note(&format!("login v2 POST {}", strip_userinfo(url)));
         let started = Instant::now();
-        let (status, value, raw) = self.post_once(url, body, false)?;
+        let (status, value, raw) = match self.post_once(url, body, false) {
+            Ok(triple) => triple,
+            Err(err) => {
+                let detail = public_error(&scrub_secrets(&err.to_string(), &self.username, &self.password));
+                return Err(self.fail_login(format!(
+                    "login v2 failed in {}ms: {detail}",
+                    started.elapsed().as_millis()
+                )));
+            }
+        };
         self.note(&format!("login v2 HTTP {status} in {}ms", started.elapsed().as_millis()));
         if status == 401 || status == 403 {
-            let msg = format!("login failed: {}", failure_line(status, &raw));
-            self.note(&msg);
-            return Err(BackendError::Message(msg));
+            return Err(self.fail_login(format!("login failed: {}", failure_line(status, &raw))));
         }
         if status != 200 {
-            let msg = format!("login failed: v2 {}", failure_line(status, &raw));
-            self.note(&msg);
-            return Err(BackendError::Message(msg));
+            return Err(self.fail_login(format!("login failed: v2 {}", failure_line(status, &raw))));
         }
         let (session_id, base) = parse_v2(&value).map_err(|err| BackendError::Message(err))?;
         let mdm = mdm_base_from_api_url(&base)?;
@@ -1502,7 +1685,7 @@ impl IdmcHttp {
         if let Some(body) = body {
             request = request.json(body);
         }
-        request.send().map_err(|err| BackendError::Message(format!("http: {err}")))
+        request.send().map_err(|err| BackendError::Message(format!("http: {}", describe_reqwest(&err))))
     }
 
     fn post_once(&self, url: &str, body: &Value, authed: bool) -> Result<(u16, Value, String), BackendError> {
@@ -1521,7 +1704,7 @@ impl IdmcHttp {
                         .header("MODEL_VERSION", info.1);
                 }
             }
-            let response = request.send().map_err(|err| BackendError::Message(format!("http: {err}")))?;
+            let response = request.send().map_err(|err| BackendError::Message(format!("http: {}", describe_reqwest(&err))))?;
             let status = response.status().as_u16();
             if status == 429 && attempt < 5 {
                 let delay = retry_delay(attempt, response.headers().get("retry-after").and_then(|v| v.to_str().ok()));
@@ -1885,7 +2068,12 @@ pub fn redact_json(value: &mut Value) {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 let lower = key.to_ascii_lowercase();
-                if lower == "sessionid" || lower == "icsessionid" || lower == "password" || lower == "ids-session-id" {
+                if lower == "sessionid"
+                    || lower == "icsessionid"
+                    || lower == "password"
+                    || lower == "username"
+                    || lower == "ids-session-id"
+                {
                     *child = Value::String("***".into());
                 } else {
                     redact_json(child);
@@ -1899,6 +2087,94 @@ pub fn redact_json(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn describe_reqwest(err: &reqwest::Error) -> String {
+    let mut parts = Vec::new();
+    let mut current: Option<&dyn std::error::Error> = Some(err);
+    let mut guard = 0;
+    while let Some(err) = current {
+        if guard > 6 {
+            break;
+        }
+        guard += 1;
+        let text = err.to_string();
+        if !parts.iter().any(|part| part == &text) {
+            parts.push(text);
+        }
+        current = err.source();
+    }
+    parts.join(": ")
+}
+
+fn scrub_secrets(message: &str, username: &str, password: &str) -> String {
+    let message = strip_userinfo(message);
+    let message = redact_token(&message, password);
+    let message = redact_token(&message, username);
+    let message = redact_jwt(&message);
+    message.chars().take(180).collect()
+}
+
+fn strip_userinfo(text: &str) -> String {
+    let mut out = text.to_string();
+    let mut search_from = 0;
+    while let Some(rel) = out[search_from..].find("://") {
+        let start = search_from + rel + 3;
+        let rest = &out[start..];
+        let Some(at) = rest.find('@') else { break };
+        let host = &rest[..at];
+        if host.contains('/') || !host.contains(':') {
+            search_from = start;
+            continue;
+        }
+        out.replace_range(start..start + at + 1, "***@");
+        search_from = start + 4;
+    }
+    out
+}
+
+fn redact_token(text: &str, secret: &str) -> String {
+    if secret.chars().count() < 3 {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let secret_chars: Vec<char> = secret.chars().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let end = index + secret_chars.len();
+        let matches = end <= chars.len()
+            && chars[index..end]
+                .iter()
+                .zip(&secret_chars)
+                .all(|(got, want)| got.eq_ignore_ascii_case(want));
+        let bounded = matches
+            && (index == 0 || !chars[index - 1].is_ascii_alphanumeric())
+            && (end >= chars.len() || !chars[end].is_ascii_alphanumeric());
+        if bounded {
+            out.push_str("***");
+            index = end;
+            continue;
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
+}
+
+fn redact_jwt(text: &str) -> String {
+    let mut out = String::new();
+    for token in text.split_inclusive(|ch: char| ch.is_whitespace()) {
+        let word = token.trim_end();
+        let space = &token[word.len()..];
+        if word.contains("eyJ") {
+            out.push_str("***");
+            out.push_str(space);
+        } else {
+            out.push_str(token);
+        }
+    }
+    out
 }
 
 fn public_error(text: &str) -> String {
@@ -1941,6 +2217,33 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
+    #[test]
+    fn login_failure_classifies_timeout_auth_and_network() {
+        assert_eq!(
+            classify_login("login v3 failed in 15015ms: http: error sending request"),
+            LoginCause::Timeout
+        );
+        assert_eq!(
+            classify_login("login v3 failed in 18ms: http: connection refused"),
+            LoginCause::Unreachable
+        );
+        assert_eq!(classify_login("login failed: HTTP 401"), LoginCause::Rejected);
+        assert_eq!(classify_login("login failed: HTTP 403"), LoginCause::Rejected);
+        assert_eq!(
+            classify_login("login v3 failed in 60015ms: http: operation timed out"),
+            LoginCause::Timeout
+        );
+        let scrubbed = scrub_secrets(
+            "http://glenn-user:s3cret-password@host/login user glenn-user password s3cret-password eyJabc.def",
+            "glenn-user",
+            "s3cret-password",
+        );
+        assert!(!scrubbed.contains("s3cret-password"), "{scrubbed}");
+        assert!(!scrubbed.contains("glenn-user"), "{scrubbed}");
+        assert!(!scrubbed.contains("eyJ"), "{scrubbed}");
+        assert!(scrub_secrets("userInfo stays", "user", "secret-pass").contains("userInfo"));
+    }
 
     #[test]
     fn mdm_host_drops_saas_and_marks_the_pod() {

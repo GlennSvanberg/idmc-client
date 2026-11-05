@@ -3,9 +3,11 @@
 use std::time::Duration;
 
 use gpui::{
-    actions, div, img, px, prelude::*, rgb, size, AnyElement, App, Application, Bounds, ClickEvent,
-    Context, FocusHandle, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, Render,
-    SharedString, Timer, Window, WindowBounds, WindowOptions,
+    actions, div, img, point, px, prelude::*, rgb, size, transparent_black, AnyElement, App, Application,
+    Bounds, ClickEvent, Context, CursorStyle, Decorations, FocusHandle, KeyBinding, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Render, ScrollHandle, SharedString, Timer,
+    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowControlArea, WindowDecorations,
+    WindowOptions,
 };
 use idmc_backend::Backend;
 use idmc_layout::Dir;
@@ -81,11 +83,20 @@ impl Render for Ghost {
     }
 }
 
+#[derive(Clone)]
+pub struct DragColumn {
+    pub view: String,
+    pub field: String,
+    pub label: String,
+}
+
 pub struct Root {
     pub session: Session,
     pub focus: FocusHandle,
     pub dirty: bool,
     pub(crate) graph_pane: std::cell::RefCell<Option<gpui::Entity<crate::graph::GraphPane>>>,
+    pub(crate) h_scroll: std::cell::RefCell<std::collections::HashMap<String, ScrollHandle>>,
+    pub(crate) v_scroll: std::cell::RefCell<std::collections::HashMap<String, UniformListScrollHandle>>,
 }
 
 impl Root {
@@ -121,6 +132,8 @@ impl Root {
             focus: cx.focus_handle(),
             dirty: false,
             graph_pane: std::cell::RefCell::new(None),
+            h_scroll: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v_scroll: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -163,6 +176,7 @@ impl Root {
         self.session.menu = Some(crate::session::MenuState {
             x: f32::from(pos.x),
             y: f32::from(pos.y),
+            grow_left: false,
             items: vec![
                 item("Open view", "", MenuCommand::Run("view.open")),
                 item("New table view", "", MenuCommand::Run("view.new_table")),
@@ -194,6 +208,43 @@ impl Root {
         self.session.menu = Some(crate::session::MenuState {
             x: f32::from(pos.x),
             y: f32::from(pos.y),
+            grow_left: true,
+            items,
+        });
+    }
+
+    pub fn open_row_menu(&mut self, view: &str, record: &str, entity: &str, pos: gpui::Point<gpui::Pixels>) {
+        self.session.select(view, record);
+        let mut items = Vec::new();
+        for target in self.session.row_targets(entity) {
+            items.push(item(
+                &format!("Open view · {}", target.label),
+                "",
+                MenuCommand::OpenLinked {
+                    source: view.to_string(),
+                    record: record.to_string(),
+                    kind: target.kind,
+                    entity: target.entity,
+                    relationship: target.relationship,
+                },
+            ));
+        }
+        items.push(item(
+            "Open detail",
+            "",
+            MenuCommand::OpenLinked {
+                source: view.to_string(),
+                record: record.to_string(),
+                kind: idmc_model::ViewKind::Detail,
+                entity: entity.to_string(),
+                relationship: "identity".to_string(),
+            },
+        ));
+        items.push(item("Show in graph", "", MenuCommand::Run("record.show_in_graph")));
+        self.session.menu = Some(crate::session::MenuState {
+            x: f32::from(pos.x),
+            y: f32::from(pos.y),
+            grow_left: false,
             items,
         });
     }
@@ -236,6 +287,54 @@ impl Root {
             }
             return;
         }
+        if !editing && self.session.editing.is_none() && self.session.focused_table().is_some() {
+            let plain = !mods.control && !mods.alt && !mods.platform && !mods.shift;
+            let command = (mods.control || mods.platform) && !mods.alt && !mods.shift;
+            let handled = match key.as_str() {
+                "left" if plain => {
+                    self.session.move_cell(-1, 0);
+                    true
+                }
+                "right" if plain => {
+                    self.session.move_cell(1, 0);
+                    true
+                }
+                "home" if command => {
+                    self.session.cell_home(true);
+                    true
+                }
+                "end" if command => {
+                    self.session.cell_end(true);
+                    true
+                }
+                "home" if plain => {
+                    self.session.cell_home(false);
+                    true
+                }
+                "end" if plain => {
+                    self.session.cell_end(false);
+                    true
+                }
+                "pageup" if plain => {
+                    self.session.cell_page(-1);
+                    true
+                }
+                "pagedown" if plain => {
+                    self.session.cell_page(1);
+                    true
+                }
+                "enter" | "f2" if plain => {
+                    self.session.edit_focused_cell();
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
         if !editing {
             if key == "escape" {
                 self.session.escape();
@@ -276,10 +375,25 @@ impl Root {
                     }
                 }
             }
-            "backspace" => self.session.backspace(),
+            "backspace" => {
+                if self.session.palette.open && self.session.palette_key_back() {
+                } else {
+                    self.session.backspace();
+                }
+            }
             "delete" | "forwarddelete" => self.session.delete_forward(),
-            "left" => self.session.move_left(shift),
-            "right" => self.session.move_right(shift),
+            "left" => {
+                if self.session.palette.open && !shift && self.session.palette_key_back() {
+                } else {
+                    self.session.move_left(shift);
+                }
+            }
+            "right" => {
+                if self.session.palette.open && !shift && self.session.palette_key_right() {
+                } else {
+                    self.session.move_right(shift);
+                }
+            }
             "home" => self.session.move_home(shift),
             "end" => self.session.move_end(shift),
             "space" => self.session.type_char(' '),
@@ -350,7 +464,7 @@ impl Root {
         cx.notify();
     }
 
-    fn render_palette(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_palette(&self, theme: &Theme, viewport: gpui::Size<gpui::Pixels>, cx: &mut Context<Self>) -> AnyElement {
         let rows = self.session.palette_rows();
         let title = match &self.session.palette.mode {
             PaletteMode::Commands => "Commands",
@@ -365,11 +479,12 @@ impl Root {
             PaletteMode::PickTemplate => "New workspace",
             PaletteMode::RenameWorkspace => "Rename workspace",
         };
+        let list_h = (crate::popover::popover_max_height(f32::from(viewport.height)) - 88.).max(120.);
         let mut list = div()
             .id("palette-list")
             .flex()
             .flex_col()
-            .max_h(px(360.))
+            .max_h(px(list_h))
             .overflow_y_scroll();
         if rows.is_empty() {
             list = list.child(div().px_3().py_2().text_color(rgb(theme.muted)).child("No matches"));
@@ -388,8 +503,14 @@ impl Root {
                     .bg(rgb(if on { theme.accent_dim } else { theme.raised }))
                     .cursor_pointer()
                     .hover(|style| style.bg(rgb(theme.hover)))
-                    .child(div().flex_1().child(row.title.clone()))
-                    .child(div().text_size(px(11.)).text_color(rgb(if on { theme.text } else { theme.muted })).child(if row.hit.is_some() { row.detail.clone() } else { row.shortcut.clone() }))
+                    .child(div().flex_1().text_color(rgb(if row.header { theme.subtle } else { theme.text })).child(row.title.clone()))
+                    .child(div().text_size(px(11.)).text_color(rgb(if on { theme.accent } else { theme.muted })).child(if self.session.drill_row(row) {
+                        "›".to_string()
+                    } else if row.hit.is_some() {
+                        row.detail.clone()
+                    } else {
+                        row.shortcut.clone()
+                    }))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.session.palette.cursor = index;
                         let effect = this.session.confirm_palette();
@@ -400,16 +521,14 @@ impl Root {
                     })),
             );
         }
-        div()
-            .absolute()
-            .top(px(72.))
-            .left(px(0.))
-            .right(px(0.))
-            .flex()
-            .justify_center()
-            .child(
-                div()
-                    .w(px(520.))
+        let width = 520.;
+        let origin_x = ((f32::from(viewport.width) - width) / 2.).max(8.);
+        let crumb = self.session.palette_crumb().join("  ›  ");
+        crate::popover::anchor_popover(
+            point(px(origin_x), px(64.)),
+            false,
+            div()
+                    .w(px(width))
                     .rounded_md()
                     .bg(rgb(theme.raised))
                     .border_1()
@@ -417,6 +536,7 @@ impl Root {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
                     .child(
                         div()
                             .px_3()
@@ -426,7 +546,7 @@ impl Root {
                             .flex()
                             .flex_col()
                             .gap(px(2.))
-                            .child(div().text_size(px(11.)).text_color(rgb(theme.subtle)).child(title))
+                            .child(div().text_size(px(11.)).text_color(rgb(theme.accent)).child(if self.session.palette_crumb().len() > 1 { crumb } else { title.to_string() }))
                             .child(
                                 div()
                                     .text_size(px(14.))
@@ -444,27 +564,36 @@ impl Root {
                                     )),
                             ),
                     )
-                    .child(list),
-            )
-            .into_any_element()
+                    .child(list)
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_size(px(11.))
+                            .text_color(rgb(theme.subtle))
+                            .child("Arrows move · Enter opens · Right drills in · Left or Backspace goes back"),
+                    ),
+        )
     }
 
-    fn render_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_menu(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(menu) = &self.session.menu else {
             return div().into_any_element();
         };
+        let max_h = crate::popover::popover_max_height(f32::from(window.viewport_size().height));
         let mut list = div()
-            .absolute()
-            .left(px(menu.x))
-            .top(px(menu.y))
+            .id("menu-list")
             .min_w(px(220.))
+            .max_h(px(max_h))
+            .overflow_y_scroll()
             .py_1()
             .rounded_md()
             .bg(rgb(theme.raised))
             .border_1()
             .border_color(rgb(theme.border))
             .flex()
-            .flex_col();
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()));
         for (index, item) in menu.items.iter().enumerate() {
             let command = item.command.clone();
             list = list.child(
@@ -484,13 +613,18 @@ impl Root {
                         match &command {
                             MenuCommand::Run(id) => this.exec(id, cx),
                             MenuCommand::Dismiss => cx.notify(),
+                            MenuCommand::OpenLinked { source, record, kind, entity, relationship } => {
+                                this.session.select(source, record);
+                                this.session.open_linked_view(source, *kind, entity, relationship);
+                                cx.notify();
+                            }
                             MenuCommand::Open { .. } | MenuCommand::Link { .. } => cx.notify(),
                         }
                         cx.stop_propagation();
                     })),
             );
         }
-        list.into_any_element()
+        crate::popover::anchor_popover(point(px(menu.x), px(menu.y)), menu.grow_left, list)
     }
 }
 
@@ -504,10 +638,8 @@ fn item(label: &str, detail: &str, command: MenuCommand) -> crate::session::Menu
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.set_window_title("IDMC Client");
         self.session.reconcile();
         let theme = theme(self.session.file.theme);
-        let summary = self.session.backend.model().summary();
         let layout = if let Some(zoom) = &self.session.file.zoom {
             if self.session.file.layout.contains(zoom) {
                 idmc_layout::Node::tabs(zoom)
@@ -529,8 +661,15 @@ impl Render for Root {
         } else {
             self.render_node(&layout, Vec::new(), &theme, cx)
         };
-        let palette = self.session.palette.open.then(|| self.render_palette(&theme, cx));
-        let menu = self.session.menu.is_some().then(|| self.render_menu(&theme, cx));
+        let viewport = window.viewport_size();
+        let palette = self.session.palette.open.then(|| self.render_palette(&theme, viewport, cx));
+        let menu = self.session.menu.is_some().then(|| self.render_menu(&theme, window, cx));
+        let failure = self.session.backend.login_failure();
+        let surface = if failure.is_some() {
+            self.login_panel(&theme, cx)
+        } else {
+            surface
+        };
         let mut root = div()
             .id("root")
             .track_focus(&self.focus)
@@ -570,33 +709,42 @@ impl Render for Root {
                     cx.notify();
                 }
             }))
-            .child(self.chrome(&summary, &theme, cx))
-            .child(self.workspace_bar(&theme, cx))
+            .child(self.title_bar(&theme, window, cx))
             .child(div().flex_1().min_h_0().p_2().child(surface))
             .children(self.confirm_bar(&theme, cx))
-            .child(self.status_bar(&theme));
+            .child(self.status_bar(&theme))
+            .children(self.column_resize_overlay(cx));
         if let Some(palette) = palette {
             root = root.child(palette);
         }
         if let Some(menu) = menu {
             root = root.child(menu);
         }
+        if failure.is_none() {
+            if let Some(id) = self.session.chooser_for.clone() {
+                if let Some(spec) = self.session.spec(&id).cloned() {
+                    root = root.child(self.render_chooser(&id, &spec.entity, &spec.columns, &theme, viewport, cx));
+                }
+            }
+        }
         root
     }
 }
 
 impl Root {
-    fn workspace_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn title_bar(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let controls = cfg!(windows) || matches!(window.window_decorations(), Decorations::Client { .. });
         let mut bar = div()
-            .h(px(32.))
-            .px_2()
+            .h(px(40.))
             .flex()
             .flex_row()
             .items_center()
-            .gap_1()
-            .bg(rgb(theme.bg))
+            .gap_2()
+            .bg(rgb(theme.panel))
             .border_b_1()
-            .border_color(rgb(theme.border));
+            .border_color(rgb(theme.border))
+            .when(cfg!(target_os = "macos"), |row| row.pl(px(72.)))
+            .child(self.drag_cluster(theme));
         for (index, name) in self.session.file.tab_names().into_iter().enumerate() {
             let on = index == self.session.file.active;
             bar = bar.child(
@@ -609,10 +757,10 @@ impl Root {
                     .rounded_sm()
                     .cursor_pointer()
                     .text_size(px(12.))
-                    .bg(rgb(if on { theme.raised } else { theme.bg }))
+                    .bg(rgb(if on { theme.raised } else { theme.panel }))
                     .text_color(rgb(if on { theme.text } else { theme.muted }))
                     .border_b_1()
-                    .border_color(rgb(if on { theme.accent } else { theme.bg }))
+                    .border_color(rgb(if on { theme.accent } else { theme.panel }))
                     .child(name)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.session.switch_workspace(index);
@@ -620,49 +768,20 @@ impl Root {
                     })),
             );
         }
-        bar.child(
-            div()
-                .id("ws-add")
-                .px_2()
-                .h(px(24.))
-                .flex()
-                .items_center()
-                .cursor_pointer()
-                .text_color(rgb(theme.text))
-                .tooltip(crate::icons::tooltip("New workspace", *theme))
-                .child(crate::icons::icon("plus").w(px(14.)).h(px(14.)).text_color(rgb(theme.accent)))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.exec("workspace.new", cx);
-                })),
-        )
-    }
-
-    fn chrome(&self, summary: &str, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let connection = self.session.backend.connection();
-        let live = connection.starts_with("Live");
-        div()
-            .h(px(40.))
-            .px_3()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .bg(rgb(theme.panel))
-            .border_b_1()
-            .border_color(rgb(theme.border))
-            .child(img("logo/mark.svg").w(px(18.)).h(px(20.)).object_fit(ObjectFit::Contain))
-            .child(div().text_size(px(13.)).child("IDMC Client"))
+        bar = bar
             .child(
                 div()
-                    .text_size(px(11.))
-                    .text_color(rgb(if live { theme.ok } else { theme.muted }))
-                    .child(connection),
+                    .id("ws-add")
+                    .px_2()
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .tooltip(crate::icons::tooltip("New workspace", *theme))
+                    .child(crate::icons::icon("plus").w(px(14.)).h(px(14.)).text_color(rgb(theme.accent)))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.exec("workspace.new", cx))),
             )
-            .child(div().text_size(px(11.)).text_color(rgb(theme.muted)).child(summary.to_string()))
-            .child(div().flex_1())
-            .when(self.session.dirty_records(), |row| {
-                row.child(div().w(px(8.)).h(px(8.)).rounded_full().bg(rgb(theme.accent)))
-            })
+            .child(self.drag_spacer())
             .child(
                 div()
                     .id("theme-toggle")
@@ -686,7 +805,219 @@ impl Root {
                     .text_color(rgb(theme.text))
                     .child("Ctrl+K")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.exec("palette.open", cx))),
+            );
+        if controls {
+            bar = bar.child(self.window_controls(theme, window, cx));
+        }
+        bar
+    }
+
+    fn drag_cluster(&self, theme: &Theme) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .pl_3()
+            .h_full()
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, cx| {
+                if cfg!(windows) {
+                    return;
+                }
+                if event.click_count >= 2 {
+                    window.zoom_window();
+                } else {
+                    window.start_window_move();
+                }
+                cx.stop_propagation();
+            })
+            .child(img("logo/mark.svg").w(px(18.)).h(px(20.)).object_fit(ObjectFit::Contain))
+            .child(div().text_size(px(13.)).text_color(rgb(theme.text)).child("IDMC Client"))
+    }
+
+    fn drag_spacer(&self) -> impl IntoElement {
+        div()
+            .flex_1()
+            .h_full()
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, cx| {
+                if cfg!(windows) {
+                    return;
+                }
+                if event.click_count >= 2 {
+                    window.zoom_window();
+                } else {
+                    window.start_window_move();
+                }
+                cx.stop_propagation();
+            })
+    }
+
+    fn window_controls(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let maximized = window.is_maximized();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .h_full()
+            .child(self.window_button("win-min", WindowControlArea::Min, "–", theme, cx, |window| window.minimize_window()))
+            .child(self.window_button(
+                "win-max",
+                WindowControlArea::Max,
+                if maximized { "❐" } else { "□" },
+                theme,
+                cx,
+                |window| window.zoom_window(),
+            ))
+            .child(
+                div()
+                    .id("win-close")
+                    .w(px(46.))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_size(px(14.))
+                    .text_color(rgb(theme.text))
+                    .window_control_area(WindowControlArea::Close)
+                    .hover(|style| style.bg(rgb(theme.hover)))
+                    .child("✕")
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                        if !cfg!(windows) {
+                            cx.quit();
+                        }
+                        cx.stop_propagation();
+                    })),
             )
+    }
+
+    fn window_button(
+        &self,
+        id: &'static str,
+        area: WindowControlArea,
+        glyph: &'static str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+        action: fn(&mut Window),
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .w(px(46.))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .text_size(px(14.))
+            .text_color(rgb(theme.text))
+            .window_control_area(area)
+            .hover(|style| style.bg(rgb(theme.hover)))
+            .child(glyph)
+            .on_mouse_down(MouseButton::Left, cx.listener(move |_, _: &MouseDownEvent, window, cx| {
+                if !cfg!(windows) {
+                    action(window);
+                }
+                cx.stop_propagation();
+            }))
+    }
+
+    fn login_panel(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let failure = self.session.backend.login_failure();
+        let busy = self.session.backend.login_busy();
+        let title = failure.as_ref().map(|item| item.cause.title()).unwrap_or("Login failed");
+        let explanation = failure.as_ref().map(|item| item.cause.explanation()).unwrap_or("");
+        let detail = failure.as_ref().map(|item| item.detail.clone()).unwrap_or_default();
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(460.))
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .rounded_md()
+                    .bg(rgb(theme.raised))
+                    .border_1()
+                    .border_color(rgb(theme.border))
+                    .child(div().text_size(px(16.)).text_color(rgb(theme.text)).child(title))
+                    .child(div().text_color(rgb(theme.muted)).child(explanation))
+                    .child(div().text_size(px(11.)).text_color(rgb(theme.subtle)).child(detail))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .pt_2()
+                            .child(
+                                div()
+                                    .id("login-retry")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .bg(rgb(theme.accent))
+                                    .text_color(rgb(theme.on_accent))
+                                    .child(if busy { "Retrying…" } else { "Retry" })
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if !this.session.backend.login_busy() {
+                                            this.session.retry_login();
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("login-mock")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .bg(rgb(theme.panel))
+                                    .text_color(rgb(theme.text))
+                                    .child("Continue with mock data")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Err(err) = this.session.continue_with_mock() {
+                                            this.session.status = err;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn column_resize_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.session.column_resize.is_none() {
+            return None;
+        }
+        Some(
+            div()
+                .id("column-resize")
+                .absolute()
+                .size_full()
+                .bg(transparent_black())
+                .cursor(CursorStyle::ResizeColumn)
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    let Some(resize) = this.session.column_resize.clone() else { return };
+                    let dx = f32::from(event.position.x) - resize.origin_x;
+                    this.session.set_column_width(&resize.view, &resize.field, resize.origin_width + dx);
+                    cx.notify();
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    if this.session.column_resize.take().is_some() {
+                        this.session.status = this.session.save().unwrap_or_else(|err| err);
+                    }
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
     }
 
     fn confirm_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -734,13 +1065,16 @@ impl Root {
 
     fn status_bar(&self, theme: &Theme) -> impl IntoElement {
         let dirty = self.session.dirty_records();
-        let text = if dirty && self.session.status.is_empty() {
-            "Unsaved changes".to_string()
-        } else if dirty {
-            format!("Unsaved changes · {}", self.session.status)
-        } else {
-            self.session.status.clone()
-        };
+        let connection = self.session.backend.connection();
+        let summary = self.session.backend.model().summary();
+        let mut parts = vec![connection, summary];
+        if dirty {
+            parts.push("Unsaved changes".into());
+        }
+        if !self.session.status.is_empty() {
+            parts.push(self.session.status.clone());
+        }
+        let text = parts.join(" · ");
         div()
             .h(px(26.))
             .px_3()
@@ -762,6 +1096,12 @@ pub fn run(session: Session) {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("IDMC Client".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(12.), px(12.))),
+                }),
+                window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
             |window, cx| {

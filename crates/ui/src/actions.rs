@@ -51,21 +51,42 @@ pub fn registry() -> &'static [Action] {
 }
 
 pub fn palette_actions(query: &str) -> Vec<&'static Action> {
-    let q = query.trim().to_ascii_lowercase();
-    registry()
+    let q: String = query.chars().filter(|ch| !ch.is_whitespace()).flat_map(|ch| ch.to_lowercase()).collect();
+    if q.is_empty() {
+        return registry().iter().collect();
+    }
+    let mut scored: Vec<(usize, &Action)> = registry()
         .iter()
-        .filter(|action| {
-            if q.is_empty() {
-                return true;
-            }
-            action.title.to_ascii_lowercase().contains(&q)
-                || action.id.to_ascii_lowercase().contains(&q)
-                || action
-                    .shortcut
-                    .map(|s| shortcut_label(s).to_ascii_lowercase().contains(&q))
-                    .unwrap_or(false)
+        .filter_map(|action| {
+            let title = action.title.to_ascii_lowercase();
+            let id = action.id.to_ascii_lowercase();
+            let shortcut = action.shortcut.map(|item| shortcut_label(item).to_ascii_lowercase()).unwrap_or_default();
+            let score = fuzzy_score(&q, &title).or_else(|| fuzzy_score(&q, &id)).or_else(|| fuzzy_score(&q, &shortcut))?;
+            Some((score, action))
         })
-        .collect()
+        .collect();
+    scored.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.id.cmp(right.1.id)));
+    scored.into_iter().map(|(_, action)| action).collect()
+}
+
+pub fn fuzzy_match(query: &str, text: &str) -> bool {
+    let q: String = query.chars().filter(|ch| !ch.is_whitespace()).flat_map(|ch| ch.to_lowercase()).collect();
+    if q.is_empty() {
+        return true;
+    }
+    fuzzy_score(&q, &text.to_ascii_lowercase()).is_some()
+}
+
+fn fuzzy_score(query: &str, text: &str) -> Option<usize> {
+    let mut score = 0;
+    let mut from = 0;
+    for ch in query.chars() {
+        let rest = text.get(from..)?;
+        let pos = rest.find(ch)?;
+        score += pos;
+        from += pos + ch.len_utf8();
+    }
+    Some(score)
 }
 
 pub fn shortcut_label(shortcut: &str) -> String {

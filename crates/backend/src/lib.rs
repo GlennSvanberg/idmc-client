@@ -209,7 +209,9 @@ mod config;
 mod live;
 
 pub use config::{load_dotenv, read_env, BackendMode, EnvConfig};
-pub use live::{check_login, mdm_base_from_api_url, LiveBackend, LiveConfig};
+pub use live::{
+    check_login, classify_login, mdm_base_from_api_url, LiveBackend, LiveConfig, LoginCause, LoginFailure,
+};
 
 #[derive(Clone, Debug)]
 struct ListCache {
@@ -765,6 +767,26 @@ impl AppBackend {
         match self {
             AppBackend::Mock(_) => Ok(()),
             AppBackend::Live(backend) => backend.restart(),
+        }
+    }
+
+    pub fn login_failure(&self) -> Option<LoginFailure> {
+        match self {
+            AppBackend::Mock(_) => None,
+            AppBackend::Live(backend) => backend.login_failure(),
+        }
+    }
+
+    pub fn login_busy(&self) -> bool {
+        match self {
+            AppBackend::Mock(_) => false,
+            AppBackend::Live(backend) => backend.login_busy(),
+        }
+    }
+
+    pub fn retry_login(&self) {
+        if let AppBackend::Live(backend) = self {
+            backend.retry_login();
         }
     }
 }

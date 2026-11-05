@@ -1,8 +1,9 @@
 //! Table, detail, and tree views. Every label and column comes from the model.
 
 use gpui::{
-    div, px, prelude::*, rgb, uniform_list, AnyElement, Context, ListHorizontalSizingBehavior,
-    MouseButton, MouseDownEvent, SharedString,
+    div, point, px, prelude::*, rgb, uniform_list, AnyElement, Context, CursorStyle,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, ScrollStrategy, ScrollWheelEvent,
+    SharedString,
 };
 use idmc_model::Record;
 use idmc_backend::Backend;
@@ -173,33 +174,108 @@ impl Root {
                     .unwrap_or_else(|| column.clone())
             })
             .collect();
+        let widths: Vec<f32> = columns.iter().map(|column| self.session.column_width(id, column)).collect();
+        let width_px: f32 = widths.iter().sum();
         let mut header = div().flex().flex_row().h(px(28.)).bg(rgb(theme.raised)).items_center();
-        for (column, label) in columns.iter().zip(column_labels.iter()) {
-            let cell = div()
-                .w(px(148.))
+        for (index, ((column, label), width)) in columns.iter().zip(column_labels.iter()).zip(widths.iter()).enumerate() {
+            let view_id = id.to_string();
+            let field = column.clone();
+            let label_text = label.clone();
+            let origin_width = *width;
+            let drop_here = self.session.column_drop.as_ref().is_some_and(|(view, at)| view == id && *at == index);
+            let mut cell = div()
+                .id(SharedString::from(format!("head-{id}-{column}")))
+                .relative()
+                .w(px(*width))
+                .h_full()
                 .flex_shrink_0()
                 .px_2()
+                .flex()
+                .items_center()
                 .text_size(px(11.))
                 .text_color(rgb(theme.muted))
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .child(label.clone());
-            if master {
-                let view_id = id.to_string();
-                let field = column.clone();
-                header = header.child(
-                    cell.id(SharedString::from(format!("sort-{id}-{column}")))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                            this.session.toggle_sort(&view_id, &field);
-                            cx.notify();
+                .when(drop_here, |cell| cell.border_l(px(2.)).border_color(rgb(theme.accent)))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("drag-{id}-{column}")))
+                        .flex_1()
+                        .overflow_hidden()
+                        .cursor(CursorStyle::OpenHand)
+                        .child(label_text.clone())
+                        .on_drag(
+                            crate::app::DragColumn { view: view_id.clone(), field: field.clone(), label: label_text },
+                            |drag, _, _, cx| cx.new(|_| crate::app::Ghost { title: drag.label.clone() }),
+                        ),
+                )
+                .on_drag_move(cx.listener({
+                    let view_id = view_id.clone();
+                    move |this, event: &gpui::DragMoveEvent<crate::app::DragColumn>, _, cx| {
+                        let bounds = event.bounds;
+                        let pos = event.event.position;
+                        let insert = if pos.x < bounds.origin.x + bounds.size.width / 2. {
+                            index
+                        } else {
+                            index + 1
+                        };
+                        this.session.column_drop = Some((view_id.clone(), insert));
+                        cx.notify();
+                    }
+                }))
+                .on_drop(cx.listener({
+                    let view_id = view_id.clone();
+                    move |this, drag: &crate::app::DragColumn, _, cx| {
+                        if drag.view == view_id {
+                            if let Some((view, at)) = this.session.column_drop.take() {
+                                this.session.drop_column(&view, &drag.field, at);
+                                this.session.status = this.session.save().unwrap_or_else(|err| err);
+                            }
+                        }
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("resize-{id}-{column}")))
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .w(px(8.))
+                        .h_full()
+                        .cursor(CursorStyle::ResizeColumn)
+                        .on_mouse_down(MouseButton::Left, cx.listener({
+                            let view_id = view_id.clone();
+                            let field = field.clone();
+                            move |this, event: &MouseDownEvent, _, cx| {
+                                if event.click_count >= 2 {
+                                    this.session.autofit_column(&view_id, &field);
+                                    this.session.column_resize = None;
+                                    this.session.status = this.session.save().unwrap_or_else(|err| err);
+                                } else {
+                                    this.session.column_resize = Some(crate::session::ColumnResize {
+                                        view: view_id.clone(),
+                                        field: field.clone(),
+                                        origin_x: f32::from(event.position.x),
+                                        origin_width,
+                                    });
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
                         })),
                 );
-                continue;
+            if master {
+                let sort_view = view_id.clone();
+                let sort_field = field.clone();
+                cell = cell.on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
+                    this.session.toggle_sort(&sort_view, &sort_field);
+                    cx.notify();
+                }));
             }
             header = header.child(cell);
         }
-        let width = px(148. * columns.len().max(1) as f32);
+        let width = px(width_px.max(1.));
         let body = if master {
             self.session.sync_master(id);
             let total = self.session.table_len(id);
@@ -212,12 +288,15 @@ impl Root {
                 let theme = *theme;
                 let entity = entity.to_string();
                 let columns = columns.to_vec();
+                let widths = widths.clone();
                 let view_id = id.to_string();
                 let selected = selected.clone();
                 let this = cx.weak_entity();
+                let v_scroll = self.list_scroll(id);
                 uniform_list(SharedString::from(format!("rows-{id}")), total, move |range, _window, app| {
                     let entity = entity.clone();
                     let columns = columns.clone();
+                    let widths = widths.clone();
                     let view_id = view_id.clone();
                     let selected = selected.clone();
                     this.update(app, |root, cx| {
@@ -226,7 +305,7 @@ impl Root {
                         for index in range {
                             if let Some(row) = root.session.master_row(&entity, index) {
                                 let on = selected.as_deref() == Some(row.id.as_str());
-                                items.push(root.table_row(index, &view_id, &entity, &columns, &row, on, &theme, cx));
+                                items.push(root.table_row(index, &view_id, &entity, &columns, &widths, &row, on, &theme, cx));
                             } else {
                                 items.push(root.placeholder_row(index, &view_id, &theme));
                             }
@@ -235,6 +314,7 @@ impl Root {
                     })
                     .unwrap_or_default()
                 })
+                .track_scroll(v_scroll)
                 .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
                 .flex_1()
                 .min_h_0()
@@ -253,8 +333,10 @@ impl Root {
             let theme = *theme;
             let entity = entity.to_string();
             let columns = columns.to_vec();
+            let widths = widths.clone();
             let view_id = id.to_string();
             let this = cx.weak_entity();
+            let v_scroll = self.list_scroll(id);
             uniform_list(
                 SharedString::from(format!("rows-{id}")),
                 rows.len(),
@@ -262,6 +344,7 @@ impl Root {
                     let rows = rows.clone();
                     let entity = entity.clone();
                     let columns = columns.clone();
+                    let widths = widths.clone();
                     let view_id = view_id.clone();
                     let selected = selected.clone();
                     this.update(app, |root, cx| {
@@ -270,7 +353,7 @@ impl Root {
                             let Some(row) = rows.get(index) else { continue };
                             let on = selected.as_deref() == Some(row.id.as_str());
                             items.push(root.table_row(
-                                index, &view_id, &entity, &columns, row, on, &theme, cx,
+                                index, &view_id, &entity, &columns, &widths, row, on, &theme, cx,
                             ));
                         }
                         items
@@ -278,17 +361,32 @@ impl Root {
                     .unwrap_or_default()
                 },
             )
+            .track_scroll(v_scroll)
             .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
             .flex_1()
             .min_h_0()
             .w(width)
             .into_any_element()
         };
-        let chooser = if self.session.chooser_for.as_deref() == Some(id) {
-            Some(self.render_chooser(id, entity, columns, theme, cx))
-        } else {
-            None
-        };
+        let h_scroll = self.horizontal_scroll(id);
+        if self.session.scroll_cell.get() {
+            if let Some(cursor) = self.session.cell.clone().filter(|cursor| cursor.view == id) {
+                self.list_scroll(id).scroll_to_item(cursor.row, ScrollStrategy::Center);
+                let mut left = 0.;
+                for (index, column_width) in widths.iter().enumerate() {
+                    if index == cursor.col {
+                        let offset = f32::from(h_scroll.offset().x);
+                        let view_w = f32::from(h_scroll.bounds().size.width);
+                        let next = crate::session::Session::reveal_offset(offset, view_w, left, *column_width);
+                        h_scroll.set_offset(point(px(next), h_scroll.offset().y));
+                        break;
+                    }
+                    left += column_width;
+                }
+            }
+            self.session.scroll_cell.set(false);
+        }
+        let grid_id = id.to_string();
         div()
             .relative()
             .size_full()
@@ -300,16 +398,37 @@ impl Root {
                 div()
                     .id(SharedString::from(format!("grid-{id}")))
                     .overflow_x_scroll()
+                    .track_scroll(&h_scroll)
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
+                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
+                        if !event.modifiers.shift {
+                            return;
+                        }
+                        let handle = this.horizontal_scroll(&grid_id);
+                        let delta = event.delta.pixel_delta(px(20.));
+                        let dx = if f32::from(delta.x).abs() > 0.5 { delta.x } else { delta.y };
+                        let offset = handle.offset();
+                        handle.set_offset(point(offset.x + dx, offset.y));
+                        cx.stop_propagation();
+                    }))
                     .child(header.w(width))
                     .child(body),
             )
-            .children(chooser)
             .children(self.choice_strip(id, theme, cx))
             .into_any_element()
+    }
+
+    fn horizontal_scroll(&self, id: &str) -> gpui::ScrollHandle {
+        let mut map = self.h_scroll.borrow_mut();
+        map.entry(id.to_string()).or_insert_with(gpui::ScrollHandle::new).clone()
+    }
+
+    fn list_scroll(&self, id: &str) -> gpui::UniformListScrollHandle {
+        let mut map = self.v_scroll.borrow_mut();
+        map.entry(id.to_string()).or_insert_with(gpui::UniformListScrollHandle::new).clone()
     }
 
     fn table_row(
@@ -318,6 +437,7 @@ impl Root {
         view_id: &str,
         entity: &str,
         columns: &[String],
+        widths: &[f32],
         row: &Record,
         on: bool,
         theme: &Theme,
@@ -325,6 +445,8 @@ impl Root {
     ) -> AnyElement {
         let view_id = view_id.to_string();
         let record_id = row.id.clone();
+        let entity_id = entity.to_string();
+        let cursor_col = self.session.cell.as_ref().filter(|cursor| cursor.view == view_id && cursor.row == index).map(|cursor| cursor.col);
         let mut line = div()
             .id(SharedString::from(format!("row-{view_id}-{index}")))
             .flex()
@@ -345,11 +467,23 @@ impl Root {
                     this.session.select(&view_id, &record_id);
                     cx.notify();
                 })
+            })
+            .on_mouse_down(MouseButton::Right, {
+                let view_id = view_id.clone();
+                let record_id = record_id.clone();
+                let entity_id = entity_id.clone();
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.open_row_menu(&view_id, &record_id, &entity_id, event.position);
+                    cx.stop_propagation();
+                    cx.notify();
+                })
             });
-        for column in columns {
+        for (col_index, column) in columns.iter().enumerate() {
             let column_id = column.clone();
             let record_for_cell = record_id.clone();
             let view_for_cell = view_id.clone();
+            let width = widths.get(col_index).copied().unwrap_or(148.);
+            let focused = cursor_col == Some(col_index);
             let editing = self.session.editing.as_ref().filter(|edit| {
                 edit.view == view_id && edit.record_id == row.id && edit.field == column.as_str()
             });
@@ -358,16 +492,24 @@ impl Root {
             line = line.child(
                 div()
                     .id(SharedString::from(format!("cell-{view_id}-{index}-{column}")))
-                    .w(px(148.))
+                    .w(px(width))
+                    .h_full()
+                    .flex()
+                    .items_center()
                     .flex_shrink_0()
                     .px_2()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_size(px(12.))
                     .text_color(rgb(if invalid.is_some() { theme.warn } else { theme.text }))
+                    .border_1()
+                    .border_color(rgb(if focused { theme.accent } else { if on { theme.accent_dim } else { theme.panel } }))
                     .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
                     .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
                         this.session.select(&view_for_cell, &record_for_cell);
+                        if let Some(cursor) = this.session.cell.as_mut() {
+                            cursor.col = col_index;
+                        }
                         this.session.begin_edit(&view_for_cell, &record_for_cell, &column_id);
                         cx.notify();
                     }))
@@ -393,12 +535,13 @@ impl Root {
             .into_any_element()
     }
 
-    fn render_chooser(
+    pub(crate) fn render_chooser(
         &self,
         id: &str,
         entity: &str,
         columns: &[String],
         theme: &Theme,
+        viewport: gpui::Size<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let filter = self.session.chooser_filter.text.to_ascii_lowercase();
@@ -453,13 +596,12 @@ impl Root {
                     })),
             );
         }
-        div()
+        let max_h = (crate::popover::popover_max_height(f32::from(viewport.height)) - 40.).max(120.);
+        let origin = point(viewport.width - px(16.), px(80.));
+        crate::popover::anchor_popover(origin, true, div()
             .id(SharedString::from(format!("chooser-{id}")))
-            .absolute()
-            .top(px(40.))
-            .right(px(8.))
             .w(px(280.))
-            .max_h(px(360.))
+            .max_h(px(max_h.max(120.)))
             .overflow_y_scroll()
             .p_2()
             .rounded_md()
@@ -477,8 +619,8 @@ impl Root {
                     .child(crate::edit::render_edit_line(&self.session.chooser_filter, "Type to filter", theme)),
             )
             .child(list)
-            .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()))
-            .into_any_element()
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation())),
+        )
     }
 
     fn render_detail(&self, id: &str, entity: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {

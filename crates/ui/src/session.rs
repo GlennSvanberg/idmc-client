@@ -2,7 +2,7 @@
 //! No GPUI types, so the behavior can be tested without a window.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,11 +27,18 @@ pub enum Effect {
 }
 
 #[derive(Clone, Debug)]
+struct PaletteFrame {
+    mode: PaletteMode,
+    edit: TextEdit,
+    cursor: usize,
+}
+
 pub struct PaletteState {
     pub open: bool,
     pub edit: TextEdit,
     pub cursor: usize,
     pub mode: PaletteMode,
+    stack: Vec<PaletteFrame>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +58,7 @@ impl PaletteState {
             edit: TextEdit::new(),
             cursor: 0,
             mode: PaletteMode::Commands,
+            stack: Vec::new(),
         }
     }
 
@@ -60,6 +68,7 @@ impl PaletteState {
             edit: TextEdit::new(),
             cursor: 0,
             mode: PaletteMode::Commands,
+            stack: Vec::new(),
         };
     }
 
@@ -72,6 +81,8 @@ impl PaletteState {
 pub struct MenuState {
     pub x: f32,
     pub y: f32,
+    /// Grow toward the left when the anchor sits on the right edge.
+    pub grow_left: bool,
     pub items: Vec<MenuItem>,
 }
 
@@ -87,7 +98,48 @@ pub enum MenuCommand {
     Run(&'static str),
     Open { kind: ViewKind, entity: String, target: String },
     Link { view: String, source: String, relationship: String },
+    OpenLinked {
+        source: String,
+        record: String,
+        kind: ViewKind,
+        entity: String,
+        relationship: String,
+    },
     Dismiss,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellCursor {
+    pub view: String,
+    pub row: usize,
+    pub col: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ColumnResize {
+    pub view: String,
+    pub field: String,
+    pub origin_x: f32,
+    pub origin_width: f32,
+}
+
+pub const MIN_COLUMN_WIDTH: f32 = 64.;
+pub const DEFAULT_COLUMN_WIDTH: f32 = 148.;
+
+#[derive(Clone, Debug)]
+pub struct MockSource {
+    pub export: Option<PathBuf>,
+    pub model: Option<PathBuf>,
+    pub data: Option<PathBuf>,
+    pub values: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowTarget {
+    pub label: String,
+    pub entity: String,
+    pub relationship: String,
+    pub kind: ViewKind,
 }
 
 struct CachedRows {
@@ -153,6 +205,13 @@ pub struct Session {
     draft_rev: u64,
     new_seq: u64,
     pub pending_delete: Option<(String, String, String)>,
+    pub cell: Option<CellCursor>,
+    pub scroll_cell: std::cell::Cell<bool>,
+    pub page_rows: usize,
+    pub column_resize: Option<ColumnResize>,
+    pub column_drop: Option<(String, usize)>,
+    pub fallback: Option<MockSource>,
+    login_line: Option<String>,
 }
 
 pub enum Launch {
@@ -201,6 +260,13 @@ impl Session {
             draft_rev: 0,
             new_seq: 0,
             pending_delete: None,
+            cell: None,
+            scroll_cell: std::cell::Cell::new(false),
+            page_rows: 12,
+            column_resize: None,
+            column_drop: None,
+            fallback: None,
+            login_line: None,
         }
     }
 
@@ -564,12 +630,26 @@ impl Session {
             return;
         }
         if self.palette.open {
-            let len = self.palette_len();
-            if len == 0 {
+            let rows = self.palette_rows();
+            if rows.is_empty() {
                 return;
             }
-            let next = self.palette.cursor as i32 + delta;
-            self.palette.cursor = next.clamp(0, len as i32 - 1) as usize;
+            let step = if delta >= 0 { 1 } else { -1 };
+            let mut next = self.palette.cursor as i32;
+            for _ in 0..rows.len() {
+                next += step;
+                if next < 0 || next >= rows.len() as i32 {
+                    return;
+                }
+                if !rows[next as usize].header {
+                    self.palette.cursor = next as usize;
+                    return;
+                }
+            }
+            return;
+        }
+        if self.editing.is_none() && self.focused_table().is_some() {
+            self.move_cell(0, delta);
             return;
         }
         let Some(focus) = self.file.focus.clone() else { return };
@@ -612,10 +692,9 @@ impl Session {
                     entity.label.as_str()
                 };
                 let title = format!("{kind_label} · {name}");
-                if q.is_empty()
-                    || title.to_ascii_lowercase().contains(&q)
-                    || entity.id.to_ascii_lowercase().contains(&q)
-                    || entity.label.to_ascii_lowercase().contains(&q)
+                if crate::actions::fuzzy_match(&q, &title)
+                    || crate::actions::fuzzy_match(&q, &entity.id)
+                    || crate::actions::fuzzy_match(&q, &entity.label)
                 {
                     out.push((kind, entity.id.clone(), title));
                 }
@@ -632,10 +711,9 @@ impl Session {
             .iter()
             .filter(|entity| kind != ViewKind::Tree || entity.hierarchy.is_some())
             .filter(|entity| {
-                q.is_empty()
-                    || entity.label.to_ascii_lowercase().contains(&q)
-                    || entity.label_plural.to_ascii_lowercase().contains(&q)
-                    || entity.id.to_ascii_lowercase().contains(&q)
+                crate::actions::fuzzy_match(&q, &entity.label)
+                    || crate::actions::fuzzy_match(&q, &entity.label_plural)
+                    || crate::actions::fuzzy_match(&q, &entity.id)
             })
             .map(|entity| {
                 let label = if kind == ViewKind::Table {
@@ -666,7 +744,7 @@ impl Session {
                 .link_options(&source_entity, &spec.entity, spec.kind)
             {
                 let label = format!("{} · {}", self.view_title(&source_id), option.label);
-                if q.is_empty() || label.to_ascii_lowercase().contains(&q) {
+                if crate::actions::fuzzy_match(&q, &label) {
                     out.push((source_id.clone(), option.relationship.clone(), label));
                 }
             }
@@ -700,6 +778,10 @@ impl Session {
                 else {
                     return Effect::None;
                 };
+                if is_drill(action.id) {
+                    self.perform(action.id);
+                    return Effect::None;
+                }
                 self.palette.open = false;
                 self.palette.edit.clear();
                 self.search_hits.clear();
@@ -773,10 +855,20 @@ impl Session {
     pub fn palette_rows(&self) -> Vec<PaletteRow> {
         match &self.palette.mode {
             PaletteMode::Commands => {
-                let mut rows: Vec<PaletteRow> = palette_actions(self.palette.query())
-                    .into_iter()
-                    .map(PaletteRow::from_action)
-                    .collect();
+                let actions = palette_actions(self.palette.query());
+                let mut rows = Vec::new();
+                if self.palette.query().trim().is_empty() {
+                    for section in ["General", "Workspace", "Views", "Records", "Data"] {
+                        let group: Vec<_> = actions.iter().copied().filter(|action| action_section(action.id) == section).collect();
+                        if group.is_empty() {
+                            continue;
+                        }
+                        rows.push(PaletteRow::header(section.to_string()));
+                        rows.extend(group.into_iter().map(PaletteRow::from_action));
+                    }
+                } else {
+                    rows.extend(actions.into_iter().map(PaletteRow::from_action));
+                }
                 let mut last = String::new();
                 for hit in &self.search_hits {
                     if hit.entity_label != last {
@@ -811,7 +903,7 @@ impl Session {
         let q = self.palette.query().trim().to_ascii_lowercase();
         template_names()
             .iter()
-            .filter(|name| q.is_empty() || name.to_ascii_lowercase().contains(&q))
+            .filter(|name| crate::actions::fuzzy_match(&q, name))
             .map(|name| (*name).to_string())
             .collect()
     }
@@ -821,6 +913,10 @@ impl Session {
             return;
         }
         let query = self.palette.query().to_string();
+        if query.trim().is_empty() {
+            self.search_hits.clear();
+            return;
+        }
         if self.backend.is_live() {
             self.backend.schedule_record_search(&query);
         } else {
@@ -842,6 +938,19 @@ impl Session {
             changed = true;
         }
         if self.absorb_graph() {
+            changed = true;
+        }
+        let failure = self.backend.login_failure();
+        let line = if self.backend.login_busy() {
+            Some("Retrying login…".to_string())
+        } else {
+            failure.as_ref().map(|failure| format!("{} · {}", failure.cause.title(), failure.detail))
+        };
+        if line != self.login_line {
+            self.login_line = line.clone();
+            if let Some(line) = line {
+                self.status = line;
+            }
             changed = true;
         }
         for line in self.backend.timing_lines() {
@@ -952,13 +1061,7 @@ impl Session {
     }
 
     fn begin_template(&mut self) {
-        self.palette = PaletteState {
-            open: true,
-            edit: TextEdit::new(),
-            cursor: 0,
-            mode: PaletteMode::PickTemplate,
-        };
-        self.menu = None;
+        self.enter_palette(PaletteMode::PickTemplate, TextEdit::new());
     }
 
     fn begin_rename(&mut self) {
@@ -968,13 +1071,78 @@ impl Session {
             edit.insert(ch);
         }
         edit.select_all();
-        self.palette = PaletteState {
-            open: true,
-            edit,
-            cursor: 0,
-            mode: PaletteMode::RenameWorkspace,
-        };
+        self.enter_palette(PaletteMode::RenameWorkspace, edit);
+    }
+
+    fn enter_palette(&mut self, mode: PaletteMode, edit: TextEdit) {
+        if self.palette.open {
+            self.palette.stack.push(PaletteFrame {
+                mode: self.palette.mode.clone(),
+                edit: self.palette.edit.clone(),
+                cursor: self.palette.cursor,
+            });
+        }
+        self.palette.open = true;
+        self.palette.mode = mode;
+        self.palette.edit = edit;
+        self.palette.cursor = 0;
         self.menu = None;
+        self.land_palette_cursor();
+    }
+
+    pub fn palette_back(&mut self) {
+        let Some(frame) = self.palette.stack.pop() else { return };
+        self.palette.mode = frame.mode;
+        self.palette.edit = frame.edit;
+        self.palette.cursor = frame.cursor;
+        self.refresh_search();
+        self.land_palette_cursor();
+    }
+
+    pub fn palette_crumb(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.palette.stack.iter().map(|frame| palette_title(&frame.mode)).collect();
+        names.push(palette_title(&self.palette.mode));
+        names
+    }
+
+    pub fn drill_row(&self, row: &PaletteRow) -> bool {
+        !row.header && row.hit.is_none() && is_drill(row.detail.as_str())
+    }
+
+    pub fn palette_key_right(&mut self) -> bool {
+        if !self.palette.open {
+            return false;
+        }
+        let at_end = self.palette.edit.caret == self.palette.edit.text.chars().count();
+        if !at_end {
+            return false;
+        }
+        let rows = self.palette_rows();
+        let Some(row) = rows.get(self.palette.cursor) else { return false };
+        if !self.drill_row(row) {
+            return false;
+        }
+        let id = row.detail.clone();
+        self.perform(&id);
+        true
+    }
+
+    pub fn palette_key_back(&mut self) -> bool {
+        if self.palette.open && self.palette.query().is_empty() && !self.palette.stack.is_empty() {
+            self.palette_back();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn land_palette_cursor(&mut self) {
+        let rows = self.palette_rows();
+        if rows.get(self.palette.cursor).is_some_and(|row| row.header) {
+            if let Some(index) = rows.iter().position(|row| !row.header) {
+                self.palette.cursor = index;
+            }
+        }
     }
 
     pub fn is_master_table(&self, view_id: &str) -> bool {
@@ -1051,13 +1219,7 @@ impl Session {
             return;
         }
         self.pending_dock = self.file.focus.clone();
-        self.palette = PaletteState {
-            open: true,
-            edit: TextEdit::new(),
-            cursor: 0,
-            mode: PaletteMode::PickEntity(kind),
-        };
-        self.menu = None;
+        self.enter_palette(PaletteMode::PickEntity(kind), TextEdit::new());
     }
 
     fn begin_open(&mut self) {
@@ -1066,13 +1228,7 @@ impl Session {
             return;
         }
         self.pending_dock = self.file.focus.clone();
-        self.palette = PaletteState {
-            open: true,
-            edit: TextEdit::new(),
-            cursor: 0,
-            mode: PaletteMode::OpenView,
-        };
-        self.menu = None;
+        self.enter_palette(PaletteMode::OpenView, TextEdit::new());
     }
 
     fn begin_link(&mut self, view: Option<String>) {
@@ -1084,12 +1240,7 @@ impl Session {
             self.status = "No open view can drive this one".into();
             return;
         }
-        self.palette = PaletteState {
-            open: true,
-            edit: TextEdit::new(),
-            cursor: 0,
-            mode: PaletteMode::PickLink(view),
-        };
+        self.enter_palette(PaletteMode::PickLink(view), TextEdit::new());
     }
 
     pub fn open_view(&mut self, kind: ViewKind, entity: &str, dock_on: Option<String>) {
@@ -1149,6 +1300,7 @@ impl Session {
             query: String::new(),
             sort_field: None,
             sort_descending: false,
+            column_widths: BTreeMap::new(),
         });
         self.file.layout.activate(&id);
         self.file.focus = Some(id.clone());
@@ -1314,7 +1466,265 @@ impl Session {
         self.file.focus = Some(view.to_string());
         self.file.layout.activate(view);
         self.file.selections.insert(view.to_string(), record.to_string());
+        if let Some(index) = self.row_index(view, record) {
+            let col = self
+                .cell
+                .as_ref()
+                .filter(|cursor| cursor.view == view)
+                .map(|cursor| cursor.col)
+                .unwrap_or(0);
+            let cols = self.spec(view).map(|spec| spec.columns.len()).unwrap_or(1).max(1);
+            self.cell = Some(CellCursor {
+                view: view.to_string(),
+                row: index,
+                col: col.min(cols - 1),
+            });
+        }
         self.reconcile();
+    }
+
+    pub fn focused_table(&self) -> Option<String> {
+        let id = self.file.focus.clone()?;
+        let spec = self.spec(&id)?;
+        (spec.kind == ViewKind::Table).then_some(id)
+    }
+
+    pub fn column_width(&self, view: &str, field: &str) -> f32 {
+        self.spec(view)
+            .and_then(|spec| spec.column_widths.get(field).copied())
+            .unwrap_or(DEFAULT_COLUMN_WIDTH)
+            .clamp(MIN_COLUMN_WIDTH, 640.)
+    }
+
+    pub fn set_column_width(&mut self, view: &str, field: &str, width: f32) {
+        let width = width.clamp(MIN_COLUMN_WIDTH, 640.);
+        if let Some(spec) = self.file.views.iter_mut().find(|spec| spec.id == view) {
+            spec.column_widths.insert(field.to_string(), width);
+        }
+    }
+
+    pub fn drop_column(&mut self, view: &str, field: &str, insert_at: usize) {
+        let Some(spec) = self.file.views.iter_mut().find(|spec| spec.id == view) else { return };
+        let Some(from) = spec.columns.iter().position(|column| column == field) else { return };
+        let mut to = insert_at.min(spec.columns.len());
+        let column = spec.columns.remove(from);
+        if from < to {
+            to -= 1;
+        }
+        let to = to.min(spec.columns.len());
+        spec.columns.insert(to, column);
+    }
+
+    pub fn autofit_column(&mut self, view: &str, field: &str) {
+        let Some(spec) = self.spec(view).cloned() else { return };
+        let label = self
+            .backend
+            .model()
+            .entity(&spec.entity)
+            .and_then(|entity| entity.field(field))
+            .map(|field| field.label.clone())
+            .unwrap_or_else(|| field.to_string());
+        let mut samples = Vec::new();
+        let limit = self.table_len(view).min(40);
+        for index in 0..limit {
+            if let Some(row) = self.row_at(view, index) {
+                samples.push(self.cell(&spec.entity, field, &row));
+            }
+        }
+        self.set_column_width(view, field, fitted_width(&label, &samples));
+    }
+
+    pub fn move_cell(&mut self, dcol: i32, drow: i32) {
+        let Some(view) = self.focused_table() else { return };
+        let cols = self.spec(&view).map(|spec| spec.columns.len()).unwrap_or(0);
+        let rows = self.table_len(&view);
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        let current = self.cell.clone().filter(|cursor| cursor.view == view).unwrap_or(CellCursor {
+            view: view.clone(),
+            row: 0,
+            col: 0,
+        });
+        let col = (current.col as i32 + dcol).clamp(0, cols as i32 - 1) as usize;
+        let row = (current.row as i32 + drow).clamp(0, rows as i32 - 1) as usize;
+        self.cell = Some(CellCursor { view: view.clone(), row, col });
+        if let Some(id) = self.row_at(&view, row).map(|record| record.id) {
+            self.file.focus = Some(view.clone());
+            self.file.layout.activate(&view);
+            self.file.selections.insert(view, id);
+            self.reconcile();
+        }
+        self.scroll_cell.set(true);
+    }
+
+    pub fn cell_home(&mut self, document: bool) {
+        let Some(view) = self.focused_table() else { return };
+        let cols = self.spec(&view).map(|spec| spec.columns.len()).unwrap_or(0);
+        if cols == 0 {
+            return;
+        }
+        if document {
+            self.cell = Some(CellCursor { view: view.clone(), row: 0, col: 0 });
+        } else if let Some(cursor) = self.cell.as_mut().filter(|cursor| cursor.view == view) {
+            cursor.col = 0;
+        } else {
+            self.cell = Some(CellCursor { view: view.clone(), row: 0, col: 0 });
+        }
+        self.sync_cell_selection();
+    }
+
+    pub fn cell_end(&mut self, document: bool) {
+        let Some(view) = self.focused_table() else { return };
+        let cols = self.spec(&view).map(|spec| spec.columns.len()).unwrap_or(0);
+        let rows = self.table_len(&view);
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        if document {
+            self.cell = Some(CellCursor { view: view.clone(), row: rows - 1, col: cols - 1 });
+        } else if let Some(cursor) = self.cell.as_mut().filter(|cursor| cursor.view == view) {
+            cursor.col = cols - 1;
+        } else {
+            self.cell = Some(CellCursor { view: view.clone(), row: 0, col: cols - 1 });
+        }
+        self.sync_cell_selection();
+    }
+
+    pub fn cell_page(&mut self, delta: i32) {
+        let step = delta.signum() * self.page_rows.max(1) as i32;
+        self.move_cell(0, step);
+    }
+
+    pub fn edit_focused_cell(&mut self) {
+        let Some(cursor) = self.cell.clone() else { return };
+        if self.focused_table().as_deref() != Some(cursor.view.as_str()) {
+            return;
+        }
+        let Some(field) = self.spec(&cursor.view).and_then(|spec| spec.columns.get(cursor.col)).cloned() else {
+            return;
+        };
+        let Some(record) = self.row_at(&cursor.view, cursor.row) else {
+            self.status = "That row is not loaded".into();
+            return;
+        };
+        self.begin_edit(&cursor.view, &record.id, &field);
+    }
+
+    fn sync_cell_selection(&mut self) {
+        let Some(cursor) = self.cell.clone() else { return };
+        if let Some(id) = self.row_at(&cursor.view, cursor.row).map(|record| record.id) {
+            self.file.focus = Some(cursor.view.clone());
+            self.file.layout.activate(&cursor.view);
+            self.file.selections.insert(cursor.view, id);
+            self.reconcile();
+        }
+        self.scroll_cell.set(true);
+    }
+
+    fn row_index(&self, view: &str, record: &str) -> Option<usize> {
+        let total = self.table_len(view);
+        let scan = total.min(400);
+        (0..scan).find(|index| self.row_at(view, *index).is_some_and(|row| row.id == record))
+    }
+
+    fn row_at(&self, view: &str, index: usize) -> Option<Record> {
+        if self.is_master_table(view) {
+            let entity = self.spec(view)?.entity.clone();
+            return self.master_row(&entity, index);
+        }
+        self.rows_cached(view).get(index).cloned()
+    }
+
+    pub fn row_targets(&self, entity: &str) -> Vec<RowTarget> {
+        let model = self.backend.model();
+        let mut out = Vec::new();
+        for child in model.embedded_children(entity) {
+            let Some(rel) = model.relationships.iter().find(|rel| rel.embedded && rel.from == entity && rel.to == child.id) else {
+                continue;
+            };
+            let label = if child.label_plural.is_empty() { child.label.clone() } else { child.label_plural.clone() };
+            out.push(RowTarget {
+                label,
+                entity: child.id.clone(),
+                relationship: rel.id.clone(),
+                kind: ViewKind::Table,
+            });
+        }
+        for rel in &model.relationships {
+            if rel.embedded || rel.from != entity {
+                continue;
+            }
+            if model.entity(&rel.to).and_then(|entry| entry.embedded_in.as_ref()).is_some() {
+                continue;
+            }
+            let kind = match rel.cardinality {
+                idmc_model::Cardinality::OneToMany => ViewKind::Table,
+                idmc_model::Cardinality::ManyToOne | idmc_model::Cardinality::OneToOne => ViewKind::Detail,
+            };
+            let label = if rel.label.is_empty() {
+                model.entity(&rel.to).map(|entry| entry.label.clone()).unwrap_or_else(|| rel.to.clone())
+            } else {
+                rel.label.clone()
+            };
+            out.push(RowTarget {
+                label,
+                entity: rel.to.clone(),
+                relationship: rel.id.clone(),
+                kind,
+            });
+        }
+        out
+    }
+
+    pub fn open_linked_view(&mut self, source: &str, kind: ViewKind, entity: &str, relationship: &str) {
+        let source = source.to_string();
+        self.file.focus = Some(source.clone());
+        let before = self.file.views.len();
+        self.open_view(kind, entity, Some(source.clone()));
+        let Some(created) = self.file.views.get(before).map(|view| view.id.clone()) else { return };
+        self.set_link(&created, &source, relationship);
+    }
+
+    pub fn reveal_offset(offset_x: f32, view_width: f32, cell_left: f32, cell_width: f32) -> f32 {
+        if view_width <= 1. {
+            return offset_x;
+        }
+        let visible_left = -offset_x;
+        let visible_right = visible_left + view_width;
+        let cell_right = cell_left + cell_width;
+        if cell_left < visible_left {
+            -cell_left
+        } else if cell_right > visible_right {
+            -(cell_right - view_width).max(0.)
+        } else {
+            offset_x
+        }
+    }
+
+    pub fn continue_with_mock(&mut self) -> Result<(), String> {
+        let source = self.fallback.clone().unwrap_or(MockSource {
+            export: None,
+            model: None,
+            data: None,
+            values: None,
+        });
+        let (backend, data_path) = open_mock(&source)?;
+        self.backend = backend;
+        if data_path.is_some() {
+            self.data_path = data_path;
+        }
+        self.login_line = None;
+        self.row_cache.borrow_mut().clear();
+        self.seen_generation = u64::MAX;
+        self.reconcile();
+        self.status = "Showing mock data".into();
+        Ok(())
+    }
+
+    pub fn retry_login(&mut self) {
+        self.backend.retry_login();
+        self.status = "Retrying login…".into();
     }
 
     pub fn dirty_records(&self) -> bool {
@@ -1889,6 +2299,7 @@ impl Session {
             edit(&mut self.palette.edit);
             self.palette.cursor = 0;
             self.refresh_search();
+            self.land_palette_cursor();
         } else if self.graph_query {
             edit(&mut self.graph_edit);
         } else if self.chooser_for.is_some() {
@@ -1989,6 +2400,69 @@ impl PaletteRow {
     }
 }
 
+fn is_drill(id: &str) -> bool {
+    matches!(
+        id,
+        "workspace.new" | "workspace.rename" | "view.new_table" | "view.new_detail" | "view.new_tree" | "view.open" | "view.link"
+    )
+}
+
+fn action_section(id: &str) -> &'static str {
+    if id.starts_with("workspace.") {
+        "Workspace"
+    } else if id.starts_with("view.") {
+        "Views"
+    } else if id.starts_with("record.") || id.starts_with("selection.") {
+        "Records"
+    } else if id.starts_with("data.") {
+        "Data"
+    } else {
+        "General"
+    }
+}
+
+fn palette_title(mode: &PaletteMode) -> String {
+    match mode {
+        PaletteMode::Commands => "Commands".into(),
+        PaletteMode::PickEntity(kind) => match kind {
+            ViewKind::Table => "New table".into(),
+            ViewKind::Detail => "New detail".into(),
+            ViewKind::Tree => "New tree".into(),
+            ViewKind::Graph => "Graph".into(),
+        },
+        PaletteMode::PickLink(_) => "Source link".into(),
+        PaletteMode::OpenView => "Open view".into(),
+        PaletteMode::PickTemplate => "Templates".into(),
+        PaletteMode::RenameWorkspace => "Rename".into(),
+    }
+}
+
+pub fn fitted_width(label: &str, samples: &[String]) -> f32 {
+    let longest = samples
+        .iter()
+        .map(|sample| sample.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(label.chars().count());
+    ((longest as f32) * 7.2 + 28.).clamp(MIN_COLUMN_WIDTH, 480.)
+}
+
+fn open_mock(source: &MockSource) -> Result<(AppBackend, Option<PathBuf>), String> {
+    if let Some(model_path) = &source.model {
+        let data_path = source.data.clone().unwrap_or_else(|| sibling(model_path, "data.json"));
+        let backend = MockBackend::open_json(model_path, &data_path).map_err(|err| err.to_string())?;
+        return Ok((AppBackend::Mock(backend), Some(data_path)));
+    }
+    if let Some(export_path) = &source.export {
+        let backend = MockBackend::open_export(export_path, source.values.as_deref(), source.data.as_deref())
+            .map_err(|err| err.to_string())?;
+        return Ok((AppBackend::Mock(backend), source.data.clone()));
+    }
+    let mock = idmc_backend::find_mock_dir().ok_or_else(|| "could not find mock/".to_string())?;
+    let backend = MockBackend::open_default().map_err(|err| err.to_string())?;
+    Ok((AppBackend::Mock(backend), Some(mock.join("data.json"))))
+}
+
 pub fn launch_from_args(args: &[String]) -> Result<Launch, String> {
     load_dotenv();
     let mut export: Option<PathBuf> = None;
@@ -2041,7 +2515,9 @@ pub fn launch_from_args(args: &[String]) -> Result<Launch, String> {
             };
         }
         let backend = AppBackend::Live(idmc_backend::LiveBackend::open(config).map_err(|err| err.to_string())?);
-        return Ok(Launch::Run(finish_session(backend, None, workspace)?));
+        let mut session = finish_session(backend, None, workspace)?;
+        session.fallback = Some(MockSource { export, model, data, values });
+        return Ok(Launch::Run(session));
     }
     let (backend, data_path) = if let Some(model_path) = model {
         let data_path = data.unwrap_or_else(|| sibling(&model_path, "data.json"));
@@ -2346,6 +2822,104 @@ mod tests {
         assert!(session.pending_delete.is_some());
         session.confirm_delete();
         assert!(session.backend.record("c360.person", &created).is_none());
+    }
+
+    #[test]
+    fn cell_cursor_moves_and_selects_the_row() {
+        let backend = AppBackend::Mock(MockBackend::open_default().unwrap());
+        let file = default_workspace(backend.model());
+        let mut session = Session::boot(backend, file, PathBuf::from("workspace.json"), None);
+        session.file.focus = Some("table-c360.person".into());
+        session.page_rows = 2;
+        session.move_cell(1, 1);
+        let cursor = session.cell.clone().unwrap();
+        assert_eq!((cursor.row, cursor.col), (1, 1));
+        let selected = session.file.selections.get("table-c360.person").cloned().unwrap();
+        assert_eq!(session.row_at("table-c360.person", 1).unwrap().id, selected);
+        session.cell_home(false);
+        assert_eq!(session.cell.as_ref().unwrap().col, 0);
+        session.cell_end(false);
+        let last = session.spec("table-c360.person").unwrap().columns.len() - 1;
+        assert_eq!(session.cell.as_ref().unwrap().col, last);
+        session.cell_end(true);
+        assert_eq!(session.cell.as_ref().unwrap().row, session.table_len("table-c360.person") - 1);
+        session.cell_home(true);
+        assert_eq!((session.cell.as_ref().unwrap().row, session.cell.as_ref().unwrap().col), (0, 0));
+        session.cell_page(1);
+        assert_eq!(session.cell.as_ref().unwrap().row, 2);
+        session.edit_focused_cell();
+        assert!(session.editing.is_some());
+        assert!(Session::reveal_offset(0., 100., 200., 40.) < 0.);
+        assert_eq!(fitted_width("Name", &["Ann".into()]), fitted_width("Name", &[]));
+    }
+
+    #[test]
+    fn columns_resize_reorder_and_round_trip() {
+        let backend = AppBackend::Mock(MockBackend::open_default().unwrap());
+        let file = default_workspace(backend.model());
+        let mut session = Session::boot(backend, file, PathBuf::from("workspace.json"), None);
+        let view = "table-c360.person";
+        let first = session.spec(view).unwrap().columns[0].clone();
+        let second = session.spec(view).unwrap().columns[1].clone();
+        session.set_column_width(view, &first, 10.);
+        assert_eq!(session.column_width(view, &first), MIN_COLUMN_WIDTH);
+        session.set_column_width(view, &first, 220.);
+        session.drop_column(view, &second, 0);
+        assert_eq!(session.spec(view).unwrap().columns[0], second);
+        let saved = session.file.clone();
+        let text = serde_json::to_string(&saved).unwrap();
+        let loaded: crate::workspace::WorkspaceFile = serde_json::from_str(&text).unwrap();
+        let spec = loaded.views.iter().find(|item| item.id == view).unwrap();
+        assert_eq!(spec.column_widths.get(&first).copied(), Some(220.));
+        assert_eq!(spec.columns[0], second);
+    }
+
+    #[test]
+    fn row_menu_targets_open_a_linked_child_view() {
+        let backend = AppBackend::Mock(MockBackend::open_default().unwrap());
+        let file = default_workspace(backend.model());
+        let mut session = Session::boot(backend, file, PathBuf::from("workspace.json"), None);
+        let targets = session.row_targets("c360.person");
+        assert!(targets.iter().any(|target| target.entity == "c360.person.PostalAddress"));
+        assert!(targets.iter().any(|target| target.entity == "c360.person.Phone"));
+        assert!(targets.iter().any(|target| target.entity == "c360.person.ElectronicAddress"));
+        session.file.focus = Some("table-c360.person".into());
+        let person = session.rows("table-c360.person")[0].id.clone();
+        session.select("table-c360.person", &person);
+        session.open_linked_view(
+            "table-c360.person",
+            ViewKind::Table,
+            "c360.person.PostalAddress",
+            "c360.person.PostalAddress#items",
+        );
+        let created = session.file.views.last().unwrap();
+        assert_eq!(created.link.as_ref().unwrap().source, "table-c360.person");
+        assert_eq!(created.link.as_ref().unwrap().relationship, "c360.person.PostalAddress#items");
+        let rows = session.rows(&created.id);
+        assert!(rows.iter().all(|row| row.id.starts_with(&format!("{person}::"))));
+    }
+
+    #[test]
+    fn palette_drills_into_new_table_and_fuzzy_finds_it() {
+        let backend = AppBackend::Mock(MockBackend::open_default().unwrap());
+        let file = default_workspace(backend.model());
+        let mut session = Session::boot(backend, file, PathBuf::from("workspace.json"), None);
+        session.perform("palette.open");
+        assert!(session.palette_rows().iter().any(|row| row.header && row.title == "Views"));
+        let index = session.palette_rows().iter().position(|row| row.detail == "view.new_table").unwrap();
+        session.palette.cursor = index;
+        assert!(session.palette_key_right());
+        assert!(session.palette_crumb().join(" ").contains("New table"));
+        session.palette_back();
+        assert!(matches!(session.palette.mode, PaletteMode::Commands));
+        session.palette.edit.clear();
+        for ch in "newt".chars() {
+            session.type_char(ch);
+        }
+        assert!(session.palette_rows().iter().any(|row| row.detail == "view.new_table"));
+        session.palette.edit.clear();
+        session.backspace();
+        assert!(session.palette.query().is_empty());
     }
 }
 

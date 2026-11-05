@@ -68,6 +68,9 @@ pub struct ViewSpec {
     pub sort_field: Option<String>,
     #[serde(default)]
     pub sort_descending: bool,
+    /// Pixel widths keyed by field id. Missing keys use the default width.
+    #[serde(default)]
+    pub column_widths: BTreeMap<String, f32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -182,6 +185,7 @@ fn view(id: &str, kind: ViewKind, entity: &str, columns: Vec<String>, link: Opti
         query: String::new(),
         sort_field: None,
         sort_descending: false,
+        column_widths: BTreeMap::new(),
     }
 }
 
@@ -487,6 +491,7 @@ fn sanitize_active(file: &mut WorkspaceFile, model: &ModelDefinition) {
         if let Some(entity) = model.entity(&view.entity) {
             let leaves: BTreeSet<String> = entity.leaves().iter().map(|f| f.id.clone()).collect();
             view.columns.retain(|column| leaves.contains(column));
+            view.column_widths.retain(|column, _| leaves.contains(column));
             if view.columns.is_empty() && view.kind == ViewKind::Table {
                 view.columns = entity.default_columns();
             }
@@ -557,6 +562,7 @@ mod tests {
             query: String::new(),
             sort_field: None,
             sort_descending: false,
+            column_widths: BTreeMap::new(),
         });
         broken.layout.insert(&people.id, "ghost", idmc_layout::Zone::Right);
         sanitize(&mut broken, backend.model());

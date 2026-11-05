@@ -39,9 +39,15 @@ Search is `POST {mdm}/search/public/api/v1/search` with `entityType`, `search: "
 
 A master table is a window, not a download. The first search returns the hit count and 500 rows. Scrolling fetches the window under the viewport, four requests at a time, sorted by the server. The client does not sort those rows again. `search` and `fields` are not sent together. A disk cache per host and entity paints the last snapshot immediately. An Egress job into a local index is the alternative if a window is not enough; it is described in `docs/performance.md` and not implemented. A 401 logs in once and retries. A 429 honors `Retry-After` (capped at 30s) or waits with a short backoff. Connect times out at 15 seconds and a read at 60. `--check-login` prints each step and does not open a window. `--debug-dump` writes responses with session ids and passwords replaced by `***`.
 
+A failed login does not exit. Transport errors and timeouts retry once in the background after two seconds, then the window stays open with the cause (network unreachable, authentication rejected, or login timed out), Retry, and Continue with mock data. A 401 or 403 is shown immediately and is not retried automatically. `--check-login` still prints and exits. The detail line is scrubbed: passwords, usernames, userinfo in URLs, and JWT-shaped tokens are not logged or shown.
+
+The window uses one client-drawn title bar (transparent system title bar, client decorations). It holds the logo, the name once, workspace tabs, the theme toggle, and Ctrl+K. On Windows the min, max, and close controls are ours; the caption region drags and a double-click maximizes. Connection text, the model summary, and save or login errors sit in the bottom status bar only.
+
+Table columns remember width and order on the view. The header edge resizes (minimum 64px, double-click fits the label and the visible cells) and the header label reorders. Arrow keys move a mint cell cursor. The focused row stays selected so linked views follow it. Shift+wheel, a horizontal trackpad, and the horizontal scrollbar move the header and the body together. Right-clicking a row opens a menu of that entity's child and linked views, plus Open detail and Show in graph. Menus and the command palette snap inside the window and scroll when they are taller than it. The palette drills into submenus with Right, returns with Left or Backspace, and filters with a subsequence match. Its colors stay the app theme.
+
 Ctrl+K searches records as well as commands. Live search waits about 150ms, then runs a full-text search on each master entity and drops the result if the query changed. Mock search is local. Choosing a hit selects that record in a table of its entity and focuses a detail linked to it.
 
-`workspace.json` version 2 stores a tab per workspace. Templates (Browse, Search & inspect, Data quality) are built from the loaded model. A version 1 file opens as one Browse tab.
+`workspace.json` version 2 stores a tab per workspace. Each table view also stores `columnWidths` by field id. Templates (Browse, Search & inspect, Data quality) are built from the loaded model. A version 1 file opens as one Browse tab.
 
 ## Workspace file
 
