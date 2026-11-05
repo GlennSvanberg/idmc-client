@@ -964,7 +964,7 @@ impl Root {
                 if maximized { "❐" } else { "□" },
                 theme,
                 cx,
-                |window| window.zoom_window(),
+                toggle_zoom,
             ))
             .child(
                 div()
@@ -981,9 +981,9 @@ impl Root {
                     .hover(|style| style.bg(rgb(theme.hover)))
                     .child("✕")
                     .on_mouse_down(MouseButton::Left, cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                        if !cfg!(windows) {
-                            cx.quit();
-                        }
+                        // Stop the click here. On Windows a caption-drag handler that
+                        // sees this mouse-down starts a move and the button never runs.
+                        cx.quit();
                         cx.stop_propagation();
                     })),
             )
@@ -1012,9 +1012,9 @@ impl Root {
             .hover(|style| style.bg(rgb(theme.hover)))
             .child(glyph)
             .on_mouse_down(MouseButton::Left, cx.listener(move |_, _: &MouseDownEvent, window, cx| {
-                if !cfg!(windows) {
-                    action(window);
-                }
+                // Run the command on every platform. Stopping propagation keeps
+                // the caption-drag handler from treating the button as a move.
+                action(window);
                 cx.stop_propagation();
             }))
     }
