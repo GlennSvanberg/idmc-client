@@ -149,6 +149,11 @@ struct Hub {
     tenant: String,
     expand_inflight: BTreeSet<String>,
     expand_ready: Vec<Scene>,
+    /// Entities whose search response has been seen, including child entities
+    /// the payload did not mention. An empty field set is "search returned
+    /// nothing", which is different from not having searched yet.
+    search_seen: BTreeSet<String>,
+    search_fields: HashMap<String, BTreeSet<String>>,
 }
 
 #[derive(Clone)]
@@ -304,6 +309,8 @@ impl LiveBackend {
                 tenant: String::new(),
                 expand_inflight: BTreeSet::new(),
                 expand_ready: Vec::new(),
+                search_seen: BTreeSet::new(),
+                search_fields: HashMap::new(),
             }),
         });
         let backend = Self { model, roots, shared };
@@ -425,9 +432,8 @@ impl LiveBackend {
         });
     }
 
-    /// GET one master off the UI thread and keep the body on that record.
-    /// Search rows omit calculated fields and some groups, so a visible row
-    /// is read back even when the search hit already contained a field group.
+    /// GET one master off the UI thread. Detail view and a completed write
+    /// use this. Table rows stay on the search hit.
     fn schedule_hydrate(&self, entity: &str, id: &str) {
         let key = format!("{entity}\0{id}");
         {
@@ -539,23 +545,18 @@ impl LiveBackend {
         for offset in offsets {
             self.spawn_page(entity, offset, epoch);
         }
-        let visible = {
-            let hub = lock(&self.shared.hub);
-            let Some(view) = hub.views.get(entity) else { return };
-            let hits = view.hits.unwrap_or(0);
-            let end = end.min(hits);
-            let mut ids = Vec::new();
-            for index in start..end {
-                let offset = (index as u64 / PAGE) * PAGE;
-                if let Some(row) = view.pages.get(&offset).and_then(|page| page.get(index - offset as usize)) {
-                    ids.push(row.id.clone());
-                }
-            }
-            ids
-        };
-        for id in visible {
-            self.schedule_hydrate(entity, &id);
+    }
+
+    /// Field ids search has returned for `entity`, in model order.
+    /// `None` until a search page for that master (or its parent) has landed.
+    pub fn search_fields(&self, entity: &str) -> Option<Vec<String>> {
+        let hub = lock(&self.shared.hub);
+        if !hub.search_seen.contains(entity) {
+            return None;
         }
+        let set = hub.search_fields.get(entity).cloned().unwrap_or_default();
+        drop(hub);
+        Some(order_search_fields(&self.model, entity, &set))
     }
 
     pub fn set_master_view(&self, entity: &str, query: &str, sort_field: Option<&str>, descending: bool) {
@@ -691,11 +692,18 @@ impl LiveBackend {
         let sort = self.sort_field_for(entity);
         let Some(cached) = read_disk(&tenant, entity, &sort, false, "") else { return };
         let mut hub = lock(&self.shared.hub);
-        let view = hub.views.entry(entity.to_string()).or_insert_with(|| EntityWindow::new(sort));
-        if view.query.is_empty() && !view.descending {
-            view.hits = Some(cached.hits);
-            view.pages = cached.pages;
-            view.revalidate = true;
+        let mut restored = None;
+        {
+            let view = hub.views.entry(entity.to_string()).or_insert_with(|| EntityWindow::new(sort));
+            if view.query.is_empty() && !view.descending {
+                view.hits = Some(cached.hits);
+                view.pages = cached.pages;
+                view.revalidate = true;
+                restored = Some(view.pages.values().flatten().cloned().collect::<Vec<_>>());
+            }
+        }
+        if let Some(rows) = restored {
+            merge_search_fields(&mut hub, observe_search_fields(&self.model, entity, &rows));
         }
     }
 }
@@ -874,7 +882,6 @@ impl Backend for LiveBackend {
         }
         let rows = if let Some(rel) = self.model.relationship(relationship) {
             if rel.embedded {
-                self.schedule_hydrate(&rel.from, source_id);
                 let parent = self.record(&rel.from, source_id).ok_or_else(|| {
                     BackendError::Message(format!("no {} record {source_id}", rel.from))
                 })?;
@@ -1268,16 +1275,20 @@ fn fetch_page(
             let shown = rows.len();
             let covers_3000 = {
                 let mut hub = lock(&shared.hub);
-                let Some(view) = hub.views.get_mut(&entity) else { return };
-                view.inflight.remove(&offset);
-                view.revalidate = false;
-                view.hits = Some(hits);
-                view.pages.insert(offset, rows);
-                hits > 3000
-                    && view.pages.iter().any(|(page_offset, page_rows)| {
-                        let start = *page_offset as usize;
-                        start <= 3000 && 3000 < start + page_rows.len()
-                    })
+                let covers = {
+                    let Some(view) = hub.views.get_mut(&entity) else { return };
+                    view.inflight.remove(&offset);
+                    view.revalidate = false;
+                    view.hits = Some(hits);
+                    view.pages.insert(offset, rows.clone());
+                    hits > 3000
+                        && view.pages.iter().any(|(page_offset, page_rows)| {
+                            let start = *page_offset as usize;
+                            start <= 3000 && 3000 < start + page_rows.len()
+                        })
+                };
+                merge_search_fields(&mut hub, observe_search_fields(&model, &entity, &rows));
+                covers
             };
             {
                 let mut hub = lock(&shared.hub);
@@ -1916,6 +1927,82 @@ pub fn retry_delay(attempt: u32, retry_after: Option<&str>) -> Duration {
     Duration::from_millis(200 * 2u64.pow(attempt.min(7))).min(Duration::from_secs(30))
 }
 
+fn observe_search_fields(
+    model: &ModelDefinition,
+    entity: &str,
+    records: &[Record],
+) -> (BTreeSet<String>, HashMap<String, BTreeSet<String>>) {
+    let mut seen = BTreeSet::new();
+    let mut fields: HashMap<String, BTreeSet<String>> = HashMap::new();
+    seen.insert(entity.to_string());
+    fields.entry(entity.to_string()).or_default();
+    for child in model.embedded_children(entity) {
+        seen.insert(child.id.clone());
+        fields.entry(child.id.clone()).or_default();
+    }
+    for record in records {
+        collect_search_fields(model, entity, &record.values, &mut fields);
+    }
+    (seen, fields)
+}
+
+fn merge_search_fields(hub: &mut Hub, observed: (BTreeSet<String>, HashMap<String, BTreeSet<String>>)) {
+    let (seen, fields) = observed;
+    hub.search_seen.extend(seen);
+    for (entity, keys) in fields {
+        hub.search_fields.entry(entity).or_default().extend(keys);
+    }
+}
+
+fn collect_search_fields(
+    model: &ModelDefinition,
+    entity: &str,
+    values: &BTreeMap<String, FieldValue>,
+    fields: &mut HashMap<String, BTreeSet<String>>,
+) {
+    let Some(ent) = model.entity(entity) else { return };
+    for (key, value) in values {
+        let Some(field) = ent.field(key) else { continue };
+        if field.system {
+            continue;
+        }
+        if field.ty == FieldType::Group {
+            let child_id = model.embedded_children(entity).find_map(|child| {
+                let embedded = child.embedded_in.as_ref()?;
+                (embedded.field == field.id || embedded.field == field.name).then(|| child.id.clone())
+            });
+            if let Some(child_id) = child_id {
+                match value {
+                    FieldValue::Group(map) => collect_search_fields(model, &child_id, map, fields),
+                    FieldValue::List(rows) => {
+                        for row in rows {
+                            if let FieldValue::Group(map) = row {
+                                collect_search_fields(model, &child_id, map, fields);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        }
+        fields.entry(entity.to_string()).or_default().insert(field.id.clone());
+    }
+}
+
+fn order_search_fields(model: &ModelDefinition, entity: &str, set: &BTreeSet<String>) -> Vec<String> {
+    let Some(ent) = model.entity(entity) else {
+        return set.iter().cloned().collect();
+    };
+    let mut out: Vec<String> = ent.leaves().into_iter().filter(|field| set.contains(&field.id)).map(|field| field.id.clone()).collect();
+    for id in set {
+        if !out.iter().any(|existing| existing == id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
 fn parse_search_page(model: &ModelDefinition, entity: &str, body: &Value) -> Result<SearchPage, BackendError> {
     let result = body.get("searchResult").unwrap_or(body);
     let records = result
@@ -2523,6 +2610,20 @@ mod tests {
         let mail = crate::project_children(&model, &read.record, "c360.person.ElectronicAddress");
         assert_eq!(mail[0].values.get("electronicAddress"), Some(&FieldValue::String("ShenAcacia@gmail.com".into())));
         assert!(read.record.values.get("_contentMeta").is_none());
+
+        let records: Vec<Record> = page.records.iter().map(|parsed| parsed.record.clone()).collect();
+        let (seen, fields) = observe_search_fields(&model, "c360.person", &records);
+        assert!(seen.contains("c360.person"));
+        assert!(seen.contains("c360.person.Phone"));
+        assert!(seen.contains("c360.person.PostalAddress"));
+        let person = fields.get("c360.person").unwrap();
+        assert!(person.contains("firstName") && person.contains("lastName") && person.contains("gender"), "{person:?}");
+        assert!(!person.contains("fullName") && !person.contains("birthDate"), "{person:?}");
+        let address = fields.get("c360.person.PostalAddress").unwrap();
+        assert!(address.contains("addressLine1") && address.contains("city") && address.contains("postalCode"), "{address:?}");
+        assert!(address.contains("country") && address.contains("state"), "{address:?}");
+        assert!(fields.get("c360.person.Phone").unwrap().is_empty());
+        assert!(fields.get("c360.person.ElectronicAddress").unwrap().is_empty());
 
         let dotted = serde_json::json!({
             "searchResult": {"hits": 1, "records": [{

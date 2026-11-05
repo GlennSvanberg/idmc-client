@@ -677,6 +677,8 @@ impl Root {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let filter = self.session.chooser_filter.text.to_ascii_lowercase();
+        let live = self.session.backend.is_live();
+        let known = self.session.backend.search_fields(entity);
         let fields = self
             .session
             .backend
@@ -684,6 +686,15 @@ impl Root {
             .entity(entity)
             .map(|ent| ent.leaves().into_iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
+        let fields: Vec<_> = fields
+            .into_iter()
+            .filter(|field| match known.as_ref() {
+                Some(ids) => ids.iter().any(|id| id == &field.id),
+                None => !live,
+            })
+            .collect();
+        let waiting = live && known.is_none();
+        let none_returned = live && known.as_ref().is_some_and(|ids| ids.is_empty());
         let mut list = div().flex().flex_col().gap(px(1.));
         for field in fields {
             if !filter.is_empty()
@@ -743,7 +754,20 @@ impl Root {
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_size(px(11.)).text_color(rgb(theme.muted)).child("Fields"))
+            .child(div().text_size(px(11.)).text_color(rgb(theme.muted)).child(if live {
+                "Search fields. The full record is in Detail."
+            } else {
+                "Fields"
+            }))
+            .child(
+                div().text_size(px(12.)).text_color(rgb(theme.subtle)).child(if waiting {
+                    "Waiting for the first search page."
+                } else if none_returned {
+                    "Search did not return fields for this entity."
+                } else {
+                    ""
+                }),
+            )
             .child(
                 div()
                     .text_size(px(12.))

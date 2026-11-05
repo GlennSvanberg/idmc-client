@@ -486,6 +486,7 @@ impl Session {
     }
 
     pub fn reconcile(&mut self) {
+        self.limit_table_columns();
         let generation = self.backend.generation();
         let sig = self.workspace_sig();
         if self.seen_generation == generation && self.seen_sig == sig {
@@ -1338,7 +1339,7 @@ impl Session {
             }
         }
         let columns = if kind == ViewKind::Table {
-            definition.default_columns()
+            self.initial_table_columns(&definition)
         } else {
             Vec::new()
         };
@@ -1465,7 +1466,66 @@ impl Session {
         }
     }
 
+    fn initial_table_columns(&self, definition: &idmc_model::EntityType) -> Vec<String> {
+        match self.backend.search_fields(&definition.id) {
+            Some(allowed) => seed_search_columns(definition, &allowed),
+            None => definition.default_columns(),
+        }
+    }
+
+    fn limit_table_columns(&mut self) {
+        if !self.backend.is_live() {
+            return;
+        }
+        let plans: Vec<(String, String)> = self
+            .file
+            .views
+            .iter()
+            .filter(|view| view.kind == ViewKind::Table)
+            .map(|view| (view.id.clone(), view.entity.clone()))
+            .collect();
+        for (id, entity) in plans {
+            let Some(allowed) = self.backend.search_fields(&entity) else { continue };
+            let seed = self
+                .backend
+                .model()
+                .entity(&entity)
+                .map(|definition| seed_search_columns(definition, &allowed))
+                .unwrap_or_else(|| allowed.iter().take(8).cloned().collect());
+            let (narrowed, width) = {
+                let Some(view) = self.file.views.iter_mut().find(|view| view.id == id) else { continue };
+                let next = retain_search_columns(&view.columns, &allowed, &seed);
+                let narrowed = next != view.columns;
+                let width = next.len();
+                if narrowed {
+                    view.columns = next;
+                }
+                (narrowed, width)
+            };
+            if narrowed {
+                if let Some(cursor) = self.cell.as_mut() {
+                    if cursor.view == id {
+                        let last = width.saturating_sub(1);
+                        if cursor.col > last {
+                            cursor.col = last;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn toggle_column(&mut self, view_id: &str, field: &str) {
+        let entity = self.spec(view_id).map(|view| view.entity.clone());
+        if let Some(entity) = entity.as_deref() {
+            if self.backend.is_live() {
+                let allowed = self.backend.search_fields(entity);
+                let already = self.spec(view_id).is_some_and(|view| view.columns.iter().any(|column| column == field));
+                if !already && !allowed.is_some_and(|ids| ids.iter().any(|id| id == field)) {
+                    return;
+                }
+            }
+        }
         let Some(view) = self.file.views.iter_mut().find(|view| view.id == view_id) else { return };
         if view.columns.iter().any(|column| column == field) {
             if view.columns.len() == 1 {
@@ -2663,6 +2723,37 @@ impl PaletteRow {
     }
 }
 
+fn seed_search_columns(entity: &idmc_model::EntityType, allowed: &[String]) -> Vec<String> {
+    let preferred: Vec<String> = entity
+        .default_columns()
+        .into_iter()
+        .filter(|id| allowed.iter().any(|field| field == id))
+        .collect();
+    if !preferred.is_empty() {
+        return preferred;
+    }
+    entity
+        .leaves()
+        .into_iter()
+        .filter(|field| !field.system && allowed.iter().any(|id| id == &field.id))
+        .take(8)
+        .map(|field| field.id.clone())
+        .collect()
+}
+
+/// Keep the columns the user chose when they are in the search set. A saved
+/// view that names only fields search never returns falls back to the seed.
+pub(crate) fn retain_search_columns(current: &[String], allowed: &[String], seed: &[String]) -> Vec<String> {
+    let kept: Vec<String> = current.iter().filter(|column| allowed.iter().any(|id| id == *column)).cloned().collect();
+    if !kept.is_empty() {
+        return kept;
+    }
+    if !seed.is_empty() {
+        return seed.to_vec();
+    }
+    allowed.iter().take(8).cloned().collect()
+}
+
 fn lookup_hit(label: &str, code: &str, query: &str) -> bool {
     if query.is_empty() {
         return true;
@@ -3333,6 +3424,20 @@ mod tests {
         let spec = loaded.views.iter().find(|item| item.id == view).unwrap();
         assert_eq!(spec.column_widths.get(&first).copied(), Some(220.));
         assert_eq!(spec.columns[0], second);
+        let kept = retain_search_columns(
+            &["fullName".into(), "firstName".into()],
+            &["firstName".into(), "lastName".into(), "gender".into()],
+            &["firstName".into(), "lastName".into()],
+        );
+        assert_eq!(kept, vec!["firstName".to_string()]);
+        let seeded = retain_search_columns(
+            &["fullName".into(), "birthDate".into()],
+            &["firstName".into(), "gender".into()],
+            &["firstName".into(), "gender".into()],
+        );
+        assert_eq!(seeded, vec!["firstName".to_string(), "gender".to_string()]);
+        let empty = retain_search_columns(&["phoneNumber".into()], &[], &[]);
+        assert!(empty.is_empty());
     }
 
     #[test]

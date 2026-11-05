@@ -58,6 +58,10 @@ pub trait Backend {
     }
     /// Ask a live list to fetch the pages covering this range. Mock data is local.
     fn master_touch(&self, _entity: &str, _start: usize, _end: usize) {}
+    /// Field ids present on search hits for this entity. `None` means search
+    /// has not reported a field set (mock data, or a live list that has not
+    /// returned a page). `Some` may be empty when search omitted the entity.
+    fn search_fields(&self, _entity: &str) -> Option<Vec<String>> { None }
     fn set_master_view(&self, _entity: &str, _query: &str, _sort_field: Option<&str>, _descending: bool) {}
     fn search_records(&self, _query: &str, _limit: usize) -> Vec<SearchHit> { Vec::new() }
     fn schedule_record_search(&self, _query: &str) {}
@@ -904,6 +908,12 @@ impl Backend for AppBackend {
     fn master_touch(&self, entity: &str, start: usize, end: usize) {
         if let AppBackend::Live(backend) = self {
             backend.master_touch(entity, start, end);
+        }
+    }
+    fn search_fields(&self, entity: &str) -> Option<Vec<String>> {
+        match self {
+            AppBackend::Mock(_) => None,
+            AppBackend::Live(backend) => backend.search_fields(entity),
         }
     }
     fn set_master_view(&self, entity: &str, query: &str, sort_field: Option<&str>, descending: bool) {
